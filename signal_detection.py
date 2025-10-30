@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-#
-# SPDX-License-Identifier: GPL-3.0
-#
-# GNU Radio Python Flow Graph
-# Title: Not titled yet
-# GNU Radio version: 3.10.9.0-rc2
-
 from PyQt5 import Qt
 from gnuradio import qtgui
 from PyQt5 import QtCore
@@ -81,6 +71,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.fft_len = fft_len = 2048
         self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
         self.cent_freq_sink = cent_freq_sink = 9e8
+        # dwell time in milliseconds for each center frequency step
+        self.sweep_dwell_ms = 200
 
         ##################################################
         # Blocks
@@ -287,10 +279,19 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.uhd_usrp_source_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.uhd_usrp_source_0, 0), (self.qtgui_freq_sink_x_0, 0))
 
+        # start a timer to step the center frequency (sweep)
+        self._sweep_timer = Qt.QTimer(self)
+        self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
+        self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
 
     def closeEvent(self, event):
         self.settings = Qt.QSettings("GNU Radio", "signal_detection")
         self.settings.setValue("geometry", self.saveGeometry())
+        try:
+            if hasattr(self, "_sweep_timer") and self._sweep_timer.isActive():
+                self._sweep_timer.stop()
+        except Exception:
+            pass
         self.stop()
         self.wait()
 
@@ -392,7 +393,19 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.qtgui_freq_sink_x_0_0.set_frequency_range(self.cent_freq_sink, self.samp_rate)
         self.uhd_usrp_sink_0_0.set_center_freq(self.cent_freq_sink, 0)
 
-
+    def _update_sweep_center_freq(self):
+        """Advance sweeper by one step and apply to source/sink. Restarts at end."""
+        try:
+            next_freq = swep_cent_freq.sweeper.next(self.step)
+            if next_freq is None:
+                # restart sweep
+                swep_cent_freq.sweeper.chunk_index = 0
+                next_freq = swep_cent_freq.sweeper.next(self.step)
+            if next_freq is not None:
+                self.set_cent_freq_source(next_freq)
+        except Exception as e:
+            # swallow exceptions from sweeper to avoid timer crash
+            print(f"Sweep update error: {e}", file=sys.stderr)
 
 
 def main(top_block_cls=signal_detection, options=None):
