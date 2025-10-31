@@ -67,13 +67,16 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.qpsk = qpsk = digital.constellation_rect([-1-1j, -1+1j, 1+1j, 1-1j], [0, 1, 3, 2],
         4, 2, 2, 1, 1).base()
         self.noise = noise = 0
-        self.gain_tx = gain_tx = 15
-        self.gain_rx = gain_rx = 15
+        self.gain_tx = gain_tx = 22
+        self.gain_rx = gain_rx = 22
         self.fft_len = fft_len = 2048
-        self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
+        # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
+        self.cent_freq_source = cent_freq_source = 4.5e6
         self.cent_freq_sink = cent_freq_sink = 9e8
         # dwell time in milliseconds for each center frequency step
         self.sweep_dwell_ms = 200
+        # sweep enabled flag (toggle with checkbox)
+        self.sweep_enabled = True
 
         ##################################################
         # Blocks
@@ -271,10 +274,13 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
         self.connect((self.blocks_add_xx_0_0, 0), (self.qtgui_freq_sink_x_0_0, 0))
         self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
-        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
-        self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
         self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
+        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
+        ### Connect log10 block directly after log10
+        self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
+        self.connect((self.blocks_nlog10_ff_0, 0), (self.epy_block_0, 0))
+        self.connect((self.epy_block_0, 0), (self.qtgui_vector_sink_f_0, 0))
+        ### end median block connection
         self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
@@ -282,9 +288,19 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.uhd_usrp_source_0, 0), (self.qtgui_freq_sink_x_0, 0))
 
         # start a timer to step the center frequency (sweep)
+        # self._sweep_timer = Qt.QTimer(self)
+        # self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
+        # self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
+        # Add a simple checkbox to enable/disable sweeping
+        self._sweep_checkbox = Qt.QCheckBox("Enable sweep")
+        self._sweep_checkbox.setChecked(self.sweep_enabled)
+        self._sweep_checkbox.stateChanged.connect(lambda s: self.set_sweep_enabled(s == QtCore.Qt.Checked))
+        self.top_layout.addWidget(self._sweep_checkbox)
+
         self._sweep_timer = Qt.QTimer(self)
         self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
-        self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
+        if self.sweep_enabled:
+            self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
 
     def closeEvent(self, event):
         self.settings = Qt.QSettings("GNU Radio", "signal_detection")
@@ -405,9 +421,26 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
                 self.set_cent_freq_source(next_freq)
+                print(f"Sweeper: Setting center frequency to {next_freq/1e6} MHz", file=sys.stderr)
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash
             print(f"Sweep update error: {e}", file=sys.stderr)
+
+    def get_sweep_enabled(self):
+        return self.sweep_enabled
+
+    def set_sweep_enabled(self, enabled):
+        """Enable or disable the sweep. Starts/stops the QTimer accordingly."""
+        self.sweep_enabled = bool(enabled)
+        try:
+            if self.sweep_enabled:
+                if not self._sweep_timer.isActive():
+                    self._sweep_timer.start(self.sweep_dwell_ms)
+            else:
+                if self._sweep_timer.isActive():
+                    self._sweep_timer.stop()
+        except Exception:
+            pass
 
 
 def main(top_block_cls=signal_detection, options=None):
