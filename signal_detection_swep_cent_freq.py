@@ -11,7 +11,6 @@ class Sweeper:
         if cent_freq > self.stop:
             return None
         self.chunk_index += 1
-        print(f"{self.chunk_index} Sweeper: Setting center frequency to {cent_freq/1e6} MHz")
         return cent_freq
 
 sweeper = Sweeper()

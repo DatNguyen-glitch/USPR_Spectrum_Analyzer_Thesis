@@ -18,6 +18,7 @@ from gnuradio import eng_notation
 from gnuradio import uhd
 import time
 import signal_detection_swep_cent_freq as swep_cent_freq  # embedded python module
+import signal_detection_epy_block_0 as epy_block_0  # embedded python block
 import sip
 
 
@@ -243,6 +244,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._qtgui_freq_sink_x_0_win = sip.wrapinstance(self.qtgui_freq_sink_x_0.qwidget(), Qt.QWidget)
         self.top_layout.addWidget(self._qtgui_freq_sink_x_0_win)
         self.fft_vxx_0 = fft.fft_vcc(fft_len, True, window.blackmanharris(fft_len), True, 10)
+        self.epy_block_0 = epy_block_0.blk(vec_len=2048)
         self.digital_constellation_modulator_0_0 = digital.generic_mod(
             constellation=qpsk,
             differential=True,
