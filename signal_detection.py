@@ -32,10 +32,10 @@ class SignalDetector(gr.sync_block):
     """
     def __init__(self,
                  vec_len=2048,
-                 samp_rate=2.4e6,
-                 center_freq=4.5e6,
-                 margin_db=6.0,
-                 min_bw_hz=1e3,
+                 samp_rate=2.6e6,
+                 center_freq=1.17e6,
+                 margin_db=30.0,
+                 min_bw_hz=1e5,
                  ignore_center_bins=3,
                  persistence_k=2,
                  out_csv="detected_signals.csv"):
@@ -94,7 +94,7 @@ class SignalDetector(gr.sync_block):
                 j = i
                 while j+1 < N and mask[j+1]:
                     j += 1
-                clusters.append((i, j))
+                clusters.append((i, j)) # i = start of a cluster, j = end of a cluster
                 i = j+1
             else:
                 i += 1
@@ -151,7 +151,9 @@ class SignalDetector(gr.sync_block):
                 snr_db = peak_db - noise_floor_db
 
                 tnow = time.time()
-                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz | BW={bw_hz:.1f} Hz | peak={peak_db:.2f} dB | noise={noise_floor_db:.2f} dB | SNR={snr_db:.2f} dB")
+                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz "
+                      f"| BW={bw_hz:.1f} Hz | peak={peak_db:.2f} dB | noise={noise_floor_db:.2f} dB "
+                      f"| SNR={snr_db:.2f} dB")
 
                 with open(self.csvfile, 'a', newline='') as f:
                     writer = csv.writer(f)
@@ -197,7 +199,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         # Variables
         ##################################################
         self.overlap = overlap = 1e-1
-        self.chunk_bw = chunk_bw = 1e7
+        self.chunk_bw = chunk_bw = 2.6e6
         self.step = step = chunk_bw*(1-overlap)
         self.vec_len = vec_len = 2048
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
@@ -209,12 +211,12 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.gain_rx = gain_rx = 22
         self.fft_len = fft_len = 2048
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
-        self.cent_freq_source = cent_freq_source = 9e8
-        self.cent_freq_sink = cent_freq_sink = 4.5e6
+        self.cent_freq_source = cent_freq_source = 7e8
+        self.cent_freq_sink = cent_freq_sink = 5e8
         # dwell time in milliseconds for each center frequency step
-        self.sweep_dwell_ms = 1000
+        self.sweep_dwell_ms = 200
         # sweep enabled flag (toggle with checkbox)
-        self.sweep_enabled = True
+        self.sweep_enabled = False
 
         ##################################################
         # Blocks
@@ -404,6 +406,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
                                               ignore_center_bins=3,
                                               persistence_k=2,
                                               out_csv="detected_signals.csv")
+        self.dc_blocker_xx_0 = filter.dc_blocker_cc(32, True)
         self.blocks_correctiq_0 = blocks.correctiq()
         self.blocks_stream_to_vector_0 = blocks.stream_to_vector(gr.sizeof_gr_complex*1, vec_len)
         self.blocks_stream_to_vector_1 = blocks.stream_to_vector(gr.sizeof_float*1, vec_len)
@@ -442,10 +445,10 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
-        # self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
+        self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
         # self.connect((self.uhd_usrp_source_0, 0), (self.blocks_correctiq_0, 0))
-        self.connect((self.uhd_usrp_source_0, 0), (self.blocks_stream_to_vector_0, 0))
-        self.connect((self.uhd_usrp_source_0, 0), (self.qtgui_freq_sink_x_0, 0))
+        self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
+        self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))
 
         # start a timer to step the center frequency (sweep)
         # self._sweep_timer = Qt.QTimer(self)
