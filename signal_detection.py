@@ -199,11 +199,11 @@ class signal_detection(gr.top_block, Qt.QWidget):
         # Variables
         ##################################################
         self.overlap = overlap = 1e-1
-        self.chunk_bw = chunk_bw = 2.6e6
+        self.chunk_bw = chunk_bw = 5e7
         self.step = step = chunk_bw*(1-overlap)
         self.vec_len = vec_len = 2048
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
-        self.samp_rate = samp_rate = 2.6e6
+        self.samp_rate = samp_rate = 5e7
         self.qpsk = qpsk = digital.constellation_rect([-1-1j, -1+1j, 1+1j, 1-1j], [0, 1, 3, 2],
         4, 2, 2, 1, 1).base()
         self.noise = noise = 0
@@ -235,9 +235,10 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._cent_freq_sink_win = qtgui.RangeWidget(self._cent_freq_sink_range, self.set_cent_freq_sink, "'cent_freq_sink'", "counter_slider", float, QtCore.Qt.Horizontal)
         self.top_layout.addWidget(self._cent_freq_sink_win)
         self.uhd_usrp_source_0 = uhd.usrp_source(
-            ",".join(("", '')),
+            ",".join(('serial=34D628E', 'lo_offset=6e6')),
             uhd.stream_args(
                 cpu_format="fc32",
+                otw_format="sc16",
                 args='',
                 channels=list(range(0,1)),
             ),
@@ -248,20 +249,24 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.uhd_usrp_source_0.set_center_freq(cent_freq_source, 0)
         self.uhd_usrp_source_0.set_antenna("RX2", 0)
         self.uhd_usrp_source_0.set_gain(gain_rx, 0)
+        self.uhd_usrp_source_0.set_auto_dc_offset(False, 0)
+        self.uhd_usrp_source_0.set_auto_iq_balance(False, 0)
         self.uhd_usrp_sink_0_0 = uhd.usrp_sink(
-            ",".join(("", '')),
+            ",".join(('serial=34D62A7', 'serial=34D62A7,otw_format=sc16')),
             uhd.stream_args(
                 cpu_format="fc32",
+                otw_format="sc16",
                 args='',
                 channels=list(range(0,1)),
             ),
             "",
         )
-        self.uhd_usrp_sink_0_0.set_samp_rate(samp_rate)
+        self.uhd_usrp_sink_0_0.set_samp_rate(2e6)
         # No synchronization enforced.
 
         self.uhd_usrp_sink_0_0.set_center_freq(cent_freq_sink, 0)
         self.uhd_usrp_sink_0_0.set_antenna("TX/RX", 0)
+        self.uhd_usrp_sink_0_0.set_bandwidth(4e6, 0)
         self.uhd_usrp_sink_0_0.set_gain(gain_tx, 0)
         self.qtgui_vector_sink_f_0 = qtgui.vector_sink_f(
             vec_len,
@@ -424,31 +429,34 @@ class signal_detection(gr.top_block, Qt.QWidget):
         ##################################################
         # Connections
         ##################################################
-        self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
-        self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
-        self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
-        self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
 
         self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
         self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
-        self.connect((self.blocks_add_xx_0_0, 0), (self.qtgui_freq_sink_x_0_0, 0))
+        self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
+        # self.connect((self.blocks_add_xx_0_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
         self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
-        self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
-        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
+        
+        
         ### Connect log10 block directly after log10
-        # self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
-        # feed PSD (dB) to both detector and vector sink
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
         # self.connect((self.epy_block_0, 0), (self.qtgui_vector_sink_f_0, 0))
         ### end median block connection
-        self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
-        self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
-        self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
         self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
-        # self.connect((self.uhd_usrp_source_0, 0), (self.blocks_correctiq_0, 0))
+        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
-        self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))
+        self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
+        self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
+        self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
+        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
+        self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
+        # Connect block to device output of integrator by 100
+        self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
+        self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
+        # After multiplication, connect to log10
+        self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
+        # feed PSD (dB) to both detector and vector sink
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
+        self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
+        
 
         # start a timer to step the center frequency (sweep)
         # self._sweep_timer = Qt.QTimer(self)
