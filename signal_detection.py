@@ -31,12 +31,12 @@ class SignalDetector(gr.sync_block):
     Logs detections to CSV and prints summary.
     """
     def __init__(self,
-                 vec_len=2048,
-                 samp_rate=2.6e6,
+                 vec_len=4096,
+                 samp_rate=5e7,
                  center_freq=1.17e6,
-                 margin_db=30.0,
+                 margin_db=10.0,
                  min_bw_hz=1e5,
-                 ignore_center_bins=3,
+                 ignore_center_bins=1,
                  persistence_k=2,
                  out_csv="detected_signals.csv"):
         gr.sync_block.__init__(self,
@@ -201,18 +201,19 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.overlap = overlap = 1e-1
         self.chunk_bw = chunk_bw = 5e7
         self.step = step = chunk_bw*(1-overlap)
-        self.vec_len = vec_len = 2048
+        self.vec_len = vec_len = 4096
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
         self.samp_rate = samp_rate = 5e7
+        self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0 = firdes.low_pass(1.0, samp_rate, 2.25e7,1e6, window.WIN_HAMMING, 6.76)
         self.qpsk = qpsk = digital.constellation_rect([-1-1j, -1+1j, 1+1j, 1-1j], [0, 1, 3, 2],
         4, 2, 2, 1, 1).base()
         self.noise = noise = 0
         self.gain_tx = gain_tx = 22
         self.gain_rx = gain_rx = 22
-        self.fft_len = fft_len = 2048
+        self.fft_len = fft_len = 4096
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
-        self.cent_freq_source = cent_freq_source = 7e8
-        self.cent_freq_sink = cent_freq_sink = 5e8
+        self.cent_freq_source = cent_freq_source = 4e8
+        self.cent_freq_sink = cent_freq_sink = 7e8
         # dwell time in milliseconds for each center frequency step
         self.sweep_dwell_ms = 200
         # sweep enabled flag (toggle with checkbox)
@@ -235,7 +236,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._cent_freq_sink_win = qtgui.RangeWidget(self._cent_freq_sink_range, self.set_cent_freq_sink, "'cent_freq_sink'", "counter_slider", float, QtCore.Qt.Horizontal)
         self.top_layout.addWidget(self._cent_freq_sink_win)
         self.uhd_usrp_source_0 = uhd.usrp_source(
-            ",".join(('serial=34D628E', 'lo_offset=6e6')),
+            ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=513','recv_frame_size=8200')),
             uhd.stream_args(
                 cpu_format="fc32",
                 otw_format="sc16",
@@ -352,7 +353,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.qtgui_freq_sink_x_0 = qtgui.freq_sink_c(
             2048, #size
             window.WIN_BLACKMAN_hARRIS, #wintype
-            cent_freq_source, #fc
+            0, #fc
             samp_rate, #bw
             "", #name
             1,
@@ -391,6 +392,16 @@ class signal_detection(gr.top_block, Qt.QWidget):
 
         self._qtgui_freq_sink_x_0_win = sip.wrapinstance(self.qtgui_freq_sink_x_0.qwidget(), Qt.QWidget)
         self.top_layout.addWidget(self._qtgui_freq_sink_x_0_win)
+        self.low_pass_filter_0 = filter.fir_filter_ccf(
+            1,
+            firdes.low_pass(
+                1,
+                3e6,
+                1.3e6,
+                1e5,
+                window.WIN_HAMMING,
+                6.76))
+        self.freq_xlating_fir_filter_xxx_0 = filter.freq_xlating_fir_filter_ccc(1, variable_low_pass_filter_taps_0, (-1e6), samp_rate)
         self.fft_vxx_0 = fft.fft_vcc(fft_len, True, window.blackmanharris(fft_len), True, 10)
         self.digital_constellation_modulator_0_0 = digital.generic_mod(
             constellation=qpsk,
@@ -433,15 +444,18 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
         self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
-        # self.connect((self.blocks_add_xx_0_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
-        self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        self.connect((self.blocks_add_xx_0_0, 0), (self.low_pass_filter_0, 0))
+        self.connect((self.low_pass_filter_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
+        
         
         
         ### Connect log10 block directly after log10
         # self.connect((self.epy_block_0, 0), (self.qtgui_vector_sink_f_0, 0))
         ### end median block connection
-        self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
-        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
+        self.connect((self.uhd_usrp_source_0, 0), (self.freq_xlating_fir_filter_xxx_0, 0))
+        self.connect((self.freq_xlating_fir_filter_xxx_0, 0), (self.dc_blocker_xx_0, 0))
+        self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
         self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
@@ -519,6 +533,13 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 self.signal_detector.set_vec_len(self.vec_len)
             except Exception:
                 pass
+
+    def get_variable_low_pass_filter_taps_0(self):
+        return self.variable_low_pass_filter_taps_0
+
+    def set_variable_low_pass_filter_taps_0(self, variable_low_pass_filter_taps_0):
+        self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0
+        self.freq_xlating_fir_filter_xxx_0.set_taps(self.variable_low_pass_filter_taps_0)
 
     def get_total_chunk(self):
         return self.total_chunk
