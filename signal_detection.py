@@ -19,149 +19,11 @@ from gnuradio import eng_notation
 from gnuradio import uhd
 import time
 import signal_detection_swep_cent_freq as swep_cent_freq  # embedded python module
+from signal_detector import SignalDetector # embedded python module
 import sip
 import csv, threading
 import numpy as np
 
-
-
-class SignalDetector(gr.sync_block):
-    """
-    SignalDetector block (input: vector float dB)
-    Logs detections to CSV and prints summary.
-    """
-    def __init__(self,
-                 vec_len=4096,
-                 samp_rate=5e7,
-                 center_freq=1.17e6,
-                 margin_db=10.0,
-                 min_bw_hz=1e5,
-                 ignore_center_bins=1,
-                 persistence_k=2,
-                 out_csv="detected_signals.csv"):
-        gr.sync_block.__init__(self,
-            name="SignalDetector",
-            in_sig=[(np.float32, int(vec_len))],
-            out_sig=[]
-        )
-        self.N = int(vec_len)
-        self.fs = float(samp_rate)
-        self.center_freq = float(center_freq)
-        self.margin_db = float(margin_db)
-        self.min_bw_hz = float(min_bw_hz)
-        self.ignore_center = int(ignore_center_bins)
-        self.persistence_k = int(persistence_k)
-
-        self.df = self.fs / self.N
-        self.min_bins = max(1, int(np.ceil(self.min_bw_hz / self.df)))
-        self._lock = threading.Lock()
-        self._consec_count = 0
-
-        self.csvfile = out_csv
-        try:
-            with open(self.csvfile, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["time", "carrier_Hz", "bandwidth_Hz", "peak_dB", "noise_floor_dB", "snr_dB"])
-        except FileExistsError:
-            print("Failed to create CSV file; it may already exist.", flush=True)
-            pass
-
-    def set_center_freq(self, f_hz):
-        with self._lock:
-            self.center_freq = float(f_hz)
-
-    def set_samp_rate(self, samp_rate):
-        with self._lock:
-            self.fs = float(samp_rate)
-            self.df = self.fs / self.N
-            self.min_bins = max(1, int(np.ceil(self.min_bw_hz / self.df)))
-
-    def set_vec_len(self, vec_len):
-        with self._lock:
-            self.N = int(vec_len)
-            self.df = self.fs / self.N
-            self.min_bins = max(1, int(np.ceil(self.min_bw_hz / self.df)))
-
-    def estimate_noise_median(self, psd_db):
-        return float(np.median(psd_db))
-
-    def find_clusters(self, mask):
-        clusters = []
-        N = len(mask)
-        i = 0
-        while i < N:
-            if mask[i]:
-                j = i
-                while j+1 < N and mask[j+1]:
-                    j += 1
-                clusters.append((i, j)) # i = start of a cluster, j = end of a cluster
-                i = j+1
-            else:
-                i += 1
-        return clusters
-
-    def compute_freq_for_bin(self, k):
-        return self.center_freq - (self.fs/2.0) + k * self.df
-
-    def work(self, input_items, output_items):
-        invecs = input_items[0]
-        for psd_db in invecs:
-            psd_db = np.array(psd_db, dtype=np.float32)
-
-            if self.ignore_center > 0:
-                center = self.N // 2
-                low = max(0, center - self.ignore_center)
-                high = min(self.N - 1, center + self.ignore_center)
-                psd_mask_for_noise = np.concatenate((psd_db[:low], psd_db[high+1:]))
-            else:
-                psd_mask_for_noise = psd_db
-
-            noise_floor_db = self.estimate_noise_median(psd_mask_for_noise)
-            threshold_db = noise_floor_db + self.margin_db
-            mask = psd_db > threshold_db
-
-            if self.ignore_center > 0:
-                mask[low:high+1] = False
-
-            clusters = self.find_clusters(mask)
-
-            detected_any = False
-            best_cluster = None
-            best_peak_db = -9999.0
-            for (s,e) in clusters:
-                width_bins = e - s + 1
-                if width_bins < self.min_bins:
-                    continue
-                detected_any = True
-                local_peak_idx = s + int(np.argmax(psd_db[s:e+1]))
-                peak_db = float(psd_db[local_peak_idx])
-                if peak_db > best_peak_db:
-                    best_peak_db = peak_db
-                    best_cluster = (s,e,local_peak_idx,peak_db)
-
-            if detected_any:
-                self._consec_count += 1
-            else:
-                self._consec_count = 0
-
-            if self._consec_count >= self.persistence_k and best_cluster is not None:
-                s,e,peak_idx,peak_db = best_cluster
-                bw_hz = (e - s + 1) * self.df
-                carrier_hz = self.compute_freq_for_bin(peak_idx)
-                snr_db = peak_db - noise_floor_db
-
-                tnow = time.time()
-                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz "
-                      f"| BW={bw_hz:.1f} Hz | peak={peak_db:.2f} dB | noise={noise_floor_db:.2f} dB "
-                      f"| SNR={snr_db:.2f} dB")
-
-                with open(self.csvfile, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([tnow, carrier_hz, bw_hz, peak_db, noise_floor_db, snr_db])
-
-                self._consec_count = 0
-
-        return len(input_items[0])
 
 class signal_detection(gr.top_block, Qt.QWidget):
 
@@ -201,7 +63,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.overlap = overlap = 1e-1
         self.chunk_bw = chunk_bw = 5e7
         self.step = step = chunk_bw*(1-overlap)
-        self.vec_len = vec_len = 4096
+        self.vec_len = vec_len = 2048
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
         self.samp_rate = samp_rate = 5e7
         self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0 = firdes.low_pass(1.0, samp_rate, 2.25e7,1e6, window.WIN_HAMMING, 6.76)
@@ -210,14 +72,14 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.noise = noise = 0
         self.gain_tx = gain_tx = 22
         self.gain_rx = gain_rx = 22
-        self.fft_len = fft_len = 4096
+        self.fft_len = fft_len = 2048
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
-        self.cent_freq_source = cent_freq_source = 4e8
-        self.cent_freq_sink = cent_freq_sink = 7e8
+        self.cent_freq_source = cent_freq_source = 1e8
+        self.cent_freq_sink = cent_freq_sink = 5.1e8
         # dwell time in milliseconds for each center frequency step
-        self.sweep_dwell_ms = 200
+        self.sweep_dwell_ms = 50
         # sweep enabled flag (toggle with checkbox)
-        self.sweep_enabled = False
+        self.sweep_enabled = True
 
         ##################################################
         # Blocks
@@ -232,9 +94,9 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._gain_rx_range = qtgui.Range(0, 50, 5e-1, self.gain_rx, 200)
         self._gain_rx_win = qtgui.RangeWidget(self._gain_rx_range, self.set_gain_rx, "'gain_rx'", "counter_slider", float, QtCore.Qt.Horizontal)
         self.top_layout.addWidget(self._gain_rx_win)
-        self._cent_freq_sink_range = qtgui.Range(4.5e6, 1e9, step, 9e8, 200)
-        self._cent_freq_sink_win = qtgui.RangeWidget(self._cent_freq_sink_range, self.set_cent_freq_sink, "'cent_freq_sink'", "counter_slider", float, QtCore.Qt.Horizontal)
-        self.top_layout.addWidget(self._cent_freq_sink_win)
+        self._cent_freq_source_range = qtgui.Range(4.5e6, 1e9, step, 9e8, 200)
+        self._cent_freq_source_win = qtgui.RangeWidget(self._cent_freq_source_range, self.set_cent_freq_source, "'cent_freq_source'", "counter_slider", float, QtCore.Qt.Horizontal)
+        self.top_layout.addWidget(self._cent_freq_source_win)
         self.uhd_usrp_source_0 = uhd.usrp_source(
             ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=513','recv_frame_size=8200')),
             uhd.stream_args(
@@ -268,6 +130,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.uhd_usrp_sink_0_0.set_center_freq(cent_freq_sink, 0)
         self.uhd_usrp_sink_0_0.set_antenna("TX/RX", 0)
         self.uhd_usrp_sink_0_0.set_bandwidth(4e6, 0)
+        self.uhd_usrp_source_0.set_rx_agc(False, 0)
         self.uhd_usrp_sink_0_0.set_gain(gain_tx, 0)
         self.qtgui_vector_sink_f_0 = qtgui.vector_sink_f(
             vec_len,
@@ -353,7 +216,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.qtgui_freq_sink_x_0 = qtgui.freq_sink_c(
             2048, #size
             window.WIN_BLACKMAN_hARRIS, #wintype
-            0, #fc
+            cent_freq_source, #fc
             samp_rate, #bw
             "", #name
             1,
@@ -392,16 +255,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
 
         self._qtgui_freq_sink_x_0_win = sip.wrapinstance(self.qtgui_freq_sink_x_0.qwidget(), Qt.QWidget)
         self.top_layout.addWidget(self._qtgui_freq_sink_x_0_win)
-        self.low_pass_filter_0 = filter.fir_filter_ccf(
-            1,
-            firdes.low_pass(
-                1,
-                3e6,
-                1.3e6,
-                1e5,
-                window.WIN_HAMMING,
-                6.76))
-        self.freq_xlating_fir_filter_xxx_0 = filter.freq_xlating_fir_filter_ccc(1, variable_low_pass_filter_taps_0, (-1e6), samp_rate)
+        self.freq_xlating_fir_filter_xxx_0 = filter.freq_xlating_fir_filter_ccc(10, variable_low_pass_filter_taps_0, (-1e6), samp_rate)
         self.fft_vxx_0 = fft.fft_vcc(fft_len, True, window.blackmanharris(fft_len), True, 10)
         self.digital_constellation_modulator_0_0 = digital.generic_mod(
             constellation=qpsk,
@@ -422,21 +276,42 @@ class signal_detection(gr.top_block, Qt.QWidget):
                                               ignore_center_bins=3,
                                               persistence_k=2,
                                               out_csv="detected_signals.csv")
-        self.dc_blocker_xx_0 = filter.dc_blocker_cc(32, True)
+        self.dc_blocker_xx_0 = filter.dc_blocker_cc(10, False)
         self.blocks_correctiq_0 = blocks.correctiq()
         self.blocks_stream_to_vector_0 = blocks.stream_to_vector(gr.sizeof_gr_complex*1, vec_len)
         self.blocks_stream_to_vector_1 = blocks.stream_to_vector(gr.sizeof_float*1, vec_len)
         self.blocks_nlog10_ff_0 = blocks.nlog10_ff(10, vec_len, (-100))
         self.blocks_keep_one_in_n_0 = blocks.keep_one_in_n(gr.sizeof_gr_complex*vec_len, (round(samp_rate/fft_len/1000)))
-        self.blocks_integrate_xx_0 = blocks.integrate_ff(100, vec_len)
+        self.blocks_integrate_xx_0 = blocks.integrate_ff(50, vec_len)
         self.blocks_complex_to_mag_squared_0 = blocks.complex_to_mag_squared(vec_len)
         self.blocks_add_xx_0_0 = blocks.add_vcc(1)
         self.blocks_multiply_xx_0 = blocks.multiply_vff(vec_len)
         self.analog_random_source_x_0_0 = blocks.vector_source_b(list(map(int, numpy.random.randint(0, 256, 10000))), True)
         self.analog_noise_source_x_0_0 = analog.noise_source_c(analog.GR_GAUSSIAN, noise, 36)
-        self.analog_const_source_x_0 = analog.sig_source_f(0, analog.GR_CONST_WAVE, 0, 0, (1/100))
-
-
+        self.analog_const_source_x_0 = analog.sig_source_f(0, analog.GR_CONST_WAVE, 0, 0, (1/50))
+        self.rational_resampler_xxx_0 = filter.rational_resampler_ccc(
+                interpolation=1,
+                decimation=2,
+                taps=[],
+                fractional_bw=0)
+        self.low_pass_filter_0 = filter.fir_filter_ccf(
+            1,                              # decimation
+            firdes.low_pass(
+                1,                          # gain
+                3e6,                        # sampling rate
+                1.3e6,                      # cutoff frequency
+                1e5,                        # transition width
+                window.WIN_HAMMING,         # window type
+                6.76))                      # beta
+        self.low_pass_filter_1 = filter.fir_filter_ccf(
+            1,                              # decimation
+            firdes.low_pass(
+                1,                          # gain
+                5e7,                        # sampling rate
+                22.5e6,                      # cutoff frequency
+                1.5e6,                        # transition width
+                window.WIN_HAMMING,         # window type
+                6.76))                      # beta
         ##################################################
         # Connections
         ##################################################
@@ -446,31 +321,50 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
         self.connect((self.blocks_add_xx_0_0, 0), (self.low_pass_filter_0, 0))
         self.connect((self.low_pass_filter_0, 0), (self.uhd_usrp_sink_0_0, 0))
-        self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
+        # self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
         
         
         
         ### Connect log10 block directly after log10
         # self.connect((self.epy_block_0, 0), (self.qtgui_vector_sink_f_0, 0))
         ### end median block connection
-        self.connect((self.uhd_usrp_source_0, 0), (self.freq_xlating_fir_filter_xxx_0, 0))
-        self.connect((self.freq_xlating_fir_filter_xxx_0, 0), (self.dc_blocker_xx_0, 0))
-        self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
+
+        ####### ----------------- Signal Detection Chain ----------------- #######
+        # self.connect((self.uhd_usrp_source_0, 0), (self.freq_xlating_fir_filter_xxx_0, 0))
+        # self.connect((self.freq_xlating_fir_filter_xxx_0, 0), (self.dc_blocker_xx_0, 0))
+        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
+        # self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
+        # # self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
+        # self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
+        # # self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
+        # self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
+        # self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
+        # self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
+        # # Connect block to device output of integrator by 100
+        # self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
+        # self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
+        # # After multiplication, connect to log10
+        # self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
+        # # feed PSD (dB) to both detector and vector sink
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
+        ####### ----------------- RAW Signal Detection Chain ----------------- #######
+        self.connect((self.uhd_usrp_source_0, 0), (self.low_pass_filter_1, 0))
+        self.connect((self.low_pass_filter_1, 0), (self.dc_blocker_xx_0, 0))
+        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
-        self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
-        self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
+        self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
         self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
         self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
-        # Connect block to device output of integrator by 100
+        # Connect block to device output of integrator by 50
         self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
         self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
         # After multiplication, connect to log10
         self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
         # feed PSD (dB) to both detector and vector sink
-        # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
-        
+        self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
 
         # start a timer to step the center frequency (sweep)
         # self._sweep_timer = Qt.QTimer(self)
@@ -554,6 +448,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.samp_rate = samp_rate
         self.blocks_keep_one_in_n_0.set_n((round(self.samp_rate/self.fft_len/1000)))
         self.qtgui_freq_sink_x_0.set_frequency_range(self.cent_freq_source, self.samp_rate)
+        self.low_pass_filter_0.set_taps(firdes.low_pass(1, self.samp_rate, 22.5e6, 1.5e6, window.WIN_HAMMING, 6.76))
         self.qtgui_freq_sink_x_0_0.set_frequency_range(self.cent_freq_sink, self.samp_rate)
         self.uhd_usrp_sink_0_0.set_samp_rate(self.samp_rate)
         self.uhd_usrp_source_0.set_samp_rate(self.samp_rate)
@@ -628,6 +523,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
                 self.set_cent_freq_source(next_freq)
+                # Add 2ms delay after changing center frequency
+                time.sleep(0.002)
                 print(f"Sweeper: Setting center frequency to {next_freq/1e6} MHz", file=sys.stderr)
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash

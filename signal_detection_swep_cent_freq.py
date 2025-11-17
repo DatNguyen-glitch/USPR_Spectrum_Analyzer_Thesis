@@ -1,7 +1,7 @@
 # this module will be imported in the into your flowgraph
 
 class Sweeper:
-    def __init__(self, start=4.5e6, stop=1e9):
+    def __init__(self, start=2.5e7, stop=1e9):
         self.start = start
         self.stop = stop
         self.chunk_index = 0
