@@ -20,6 +20,7 @@ from gnuradio import uhd
 import time
 import signal_detection_swep_cent_freq as swep_cent_freq  # embedded python module
 from signal_detector import SignalDetector # embedded python module
+from ring_buffer import ring_buffer
 import sip
 import csv, threading
 import numpy as np
@@ -75,9 +76,12 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.fft_len = fft_len = 2048
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
         self.cent_freq_source = cent_freq_source = 1e8
-        self.cent_freq_sink = cent_freq_sink = 5.1e8
+        ############## IMPORTANT: antenna must support this frequency! ##############
+        self.cent_freq_sink = cent_freq_sink = 5.1e8   # IMPORTANT: antenna must support this frequency!
+        #############################################################################
+
         # dwell time in milliseconds for each center frequency step
-        self.sweep_dwell_ms = 50
+        self.sweep_dwell_ms = 30
         # sweep enabled flag (toggle with checkbox)
         self.sweep_enabled = True
 
@@ -98,7 +102,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._cent_freq_source_win = qtgui.RangeWidget(self._cent_freq_source_range, self.set_cent_freq_source, "'cent_freq_source'", "counter_slider", float, QtCore.Qt.Horizontal)
         self.top_layout.addWidget(self._cent_freq_source_win)
         self.uhd_usrp_source_0 = uhd.usrp_source(
-            ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=513','recv_frame_size=8200')),
+            ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=32','recv_frame_size=8200')),
             uhd.stream_args(
                 cpu_format="fc32",
                 otw_format="sc16",
@@ -267,28 +271,31 @@ class signal_detection(gr.top_block, Qt.QWidget):
             log=False,
             truncate=False)
         # self.epy_block_0 = epy_block_0.blk(vec_len=2048, threshold_dB=10.0)  # embedded python block
-        # instantiate SignalDetector and replace embedded block
+        # instantiate ring_buffer and SignalDetector, and connect them
+        self.ring_buffer = ring_buffer(samp_rate=self.samp_rate, buffer_ms=1, post_ms=1)
         self.signal_detector = SignalDetector(vec_len=self.vec_len,
-                                              samp_rate=self.samp_rate,
-                                              center_freq=self.cent_freq_source,
-                                              margin_db=10.0,
-                                              min_bw_hz=1e3,
-                                              ignore_center_bins=3,
-                                              persistence_k=2,
-                                              out_csv="detected_signals.csv")
+                              samp_rate=self.samp_rate,
+                              center_freq=self.cent_freq_source,
+                              margin_db=30.0,
+                              min_bw_hz=1e5,
+                              ignore_center_bins=4,
+                              persistence_k=4,
+                              out_csv="detected_signals.csv",
+                              ring_buffer=self.ring_buffer)
         self.dc_blocker_xx_0 = filter.dc_blocker_cc(10, False)
         self.blocks_correctiq_0 = blocks.correctiq()
         self.blocks_stream_to_vector_0 = blocks.stream_to_vector(gr.sizeof_gr_complex*1, vec_len)
         self.blocks_stream_to_vector_1 = blocks.stream_to_vector(gr.sizeof_float*1, vec_len)
         self.blocks_nlog10_ff_0 = blocks.nlog10_ff(10, vec_len, (-100))
         self.blocks_keep_one_in_n_0 = blocks.keep_one_in_n(gr.sizeof_gr_complex*vec_len, (round(samp_rate/fft_len/1000)))
-        self.blocks_integrate_xx_0 = blocks.integrate_ff(50, vec_len)
+        self.blocks_keep_one_in_n_1 = blocks.keep_one_in_n(gr.sizeof_float*vec_len, 5)
+        self.blocks_integrate_xx_0 = blocks.integrate_ff(10, vec_len)
         self.blocks_complex_to_mag_squared_0 = blocks.complex_to_mag_squared(vec_len)
         self.blocks_add_xx_0_0 = blocks.add_vcc(1)
         self.blocks_multiply_xx_0 = blocks.multiply_vff(vec_len)
         self.analog_random_source_x_0_0 = blocks.vector_source_b(list(map(int, numpy.random.randint(0, 256, 10000))), True)
         self.analog_noise_source_x_0_0 = analog.noise_source_c(analog.GR_GAUSSIAN, noise, 36)
-        self.analog_const_source_x_0 = analog.sig_source_f(0, analog.GR_CONST_WAVE, 0, 0, (1/50))
+        self.analog_const_source_x_0 = analog.sig_source_f(0, analog.GR_CONST_WAVE, 0, 0, (1/10))
         self.rational_resampler_xxx_0 = filter.rational_resampler_ccc(
                 interpolation=1,
                 decimation=2,
@@ -352,6 +359,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.uhd_usrp_source_0, 0), (self.low_pass_filter_1, 0))
         self.connect((self.low_pass_filter_1, 0), (self.dc_blocker_xx_0, 0))
         # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
+        # Connect RX IQ stream to ring_buffer for event capture
+        self.connect((self.dc_blocker_xx_0, 0), (self.ring_buffer, 0))
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
@@ -447,6 +456,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
     def set_samp_rate(self, samp_rate):
         self.samp_rate = samp_rate
         self.blocks_keep_one_in_n_0.set_n((round(self.samp_rate/self.fft_len/1000)))
+        self.blocks_keep_one_in_n_1.set_n(5)
         self.qtgui_freq_sink_x_0.set_frequency_range(self.cent_freq_source, self.samp_rate)
         self.low_pass_filter_0.set_taps(firdes.low_pass(1, self.samp_rate, 22.5e6, 1.5e6, window.WIN_HAMMING, 6.76))
         self.qtgui_freq_sink_x_0_0.set_frequency_range(self.cent_freq_sink, self.samp_rate)
@@ -522,13 +532,28 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 swep_cent_freq.sweeper.chunk_index = 0
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
+                self.signal_detector.set_enabled(False)
                 self.set_cent_freq_source(next_freq)
-                # Add 2ms delay after changing center frequency
-                time.sleep(0.002)
                 print(f"Sweeper: Setting center frequency to {next_freq/1e6} MHz", file=sys.stderr)
+                start_wait = time.time()
+                timeout = 0.01 
+                lo_locked = False
+                while (time.time() - start_wait) < timeout:
+                    lo_locked_sensor = self.uhd_usrp_source_0.get_sensor("lo_locked", 0)
+                    if lo_locked_sensor.to_bool():
+                        lo_locked = True
+                        break
+                    # time.sleep(0.001)
+                after_wait = time.time()
+                if lo_locked:
+                    self.signal_detector.set_enabled(True)
+                else:
+                    print(f"WARNING: PLL failed to lock at {next_freq/1e6} MHz!", file=sys.stderr)
+                    self.signal_detector.set_enabled(True)
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash
             print(f"Sweep update error: {e}", file=sys.stderr)
+            self.signal_detector.set_enabled(True)
 
     def get_sweep_enabled(self):
         return self.sweep_enabled
