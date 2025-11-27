@@ -1,8 +1,11 @@
 from gnuradio import gr
+from metadata_logger import MetadataLogger
 import numpy as np
 import csv
 import threading
 import time
+import os
+import pmt
 
 class SignalDetector(gr.sync_block):
     """
@@ -27,7 +30,7 @@ class SignalDetector(gr.sync_block):
         self.ring_buffer = ring_buffer
         self.N = int(vec_len)
         self.fs = float(samp_rate)
-        self.center_freq = float(center_freq)
+        self.center_freq = float(center_freq)       # auto update through Tag
         self.margin_db = float(margin_db)
         self.min_bw_hz = float(min_bw_hz)
         self.ignore_center = int(ignore_center_bins)
@@ -39,18 +42,29 @@ class SignalDetector(gr.sync_block):
         self._consec_count = 0
 
         self.csvfile = out_csv
-        self.enabled = True
+        self.metadata_db = MetadataLogger("signals_metadata.db")
         try:
-            with open(self.csvfile, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["time", "carrier_Hz", "bandwidth_Hz", "peak_dB", "noise_floor_dB", "snr_dB"])
-        except FileExistsError:
-            print("Failed to create CSV file; it may already exist.", flush=True)
-            pass
+            self._csv_file_handle = open(self.csvfile, 'a', newline='')
+            self._csv_writer = csv.writer(self._csv_file_handle)
+            if self._csv_file_handle.tell() == 0:
+                 self._csv_writer.writerow(["time", "carrier_Hz", "bandwidth_Hz", "peak_dB", "noise_floor_dB", "snr_dB"])
+                 self._csv_file_handle.flush()
+        except Exception as e:
+            print(f"[SignalDetector] CSV Error: {e}")
+            self._csv_file_handle = None
+
+        self._blanking_samples = 0
+        self.BLANK_VEC_COUNT = 50
+        self.enabled = True
+        # Hanning Window 5 tap or Moving Average smoothing the noise
+        self.smooth_window = np.ones(5) / 5.0
 
     def set_center_freq(self, f_hz):
-        with self._lock:
-            self.center_freq = float(f_hz)
+        pass
+        # with self._lock:
+        #     self.center_freq = float(f_hz)
+        #     self._consec_count = 0
+        #     self._blanking_samples = 10         # blank for 10 samples after freq change
 
     def set_samp_rate(self, samp_rate):
         with self._lock:
@@ -87,12 +101,34 @@ class SignalDetector(gr.sync_block):
 
     def set_enabled(self, state):
         self.enabled = state
+        if not state:
+            self._consec_count = 0
 
     def work(self, input_items, output_items):
         if not self.enabled:
             return len(input_items[0])
         invecs = input_items[0]
-        for psd_db in invecs:
+        n_items = len(invecs)
+        
+        tags = self.get_tags_in_window(0, 0, n_items)
+        for tag in tags:
+            key = pmt.to_python(tag.key)
+            if key == 'rx_freq':
+                new_freq = float(pmt.to_python(tag.value))
+                if abs(new_freq - self.center_freq) > 1.0:
+                    print(f"[Sync] Freq changed to {new_freq/1e6:.1f} MHz based on Tag")
+                    self.center_freq = new_freq
+                    self.center_freq = new_freq
+                    self._consec_count = 0
+                    self._blanking_samples = self.BLANK_VEC_COUNT
+
+        for i in range(n_items):
+            if self._blanking_samples > 0:
+                self._blanking_samples -= 1     # blank for 10 samples after freq change
+                continue
+
+            raw_psd_db = invecs[i]
+            psd_db = np.convolve(raw_psd_db, self.smooth_window, mode='same')
             psd_db = np.array(psd_db, dtype=np.float32)
 
             if self.ignore_center > 0:
@@ -138,18 +174,34 @@ class SignalDetector(gr.sync_block):
                 snr_db = peak_db - noise_floor_db
 
                 tnow = time.time()
-                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz "
-                      f"| BW={bw_hz/1e6:.6f} MHz | peak={peak_db:.2f} dB | noise={noise_floor_db:.2f} dB "
-                      f"| SNR={snr_db:.2f} dB")
-                with open(self.csvfile, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([tnow, f"{carrier_hz/1e6:.6f}", f"{bw_hz/1e6:.6f}", f"{peak_db:.2f}", f"{noise_floor_db:.2f}", f"{snr_db:.2f}"])
+                # print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz "
+                #       f"| BW={bw_hz/1e6:.6f} MHz | peak={peak_db:.2f} dB | noise={noise_floor_db:.2f} dB "
+                #       f"| SNR={snr_db:.2f} dB")
+                # if self._csv_file_handle is not None:
+                #     self._csv_writer.writerow([tnow, f"{carrier_hz/1e6:.6f}", f"{bw_hz/1e6:.6f}", f"{peak_db:.2f}", f"{noise_floor_db:.2f}", f"{snr_db:.2f}"])
+                #     self._csv_file_handle.flush()
+                detected_filename = ""
+                if self.ring_buffer:
+                    self.ring_buffer.set_trigger(center_freq=self.center_freq, carrier_hz=carrier_hz)
+                    detected_filename = self.ring_buffer.current_filename
+                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz | File: {os.path.basename(detected_filename)}", flush=True)
+                # --- METADATA CAPTURE ---
+                if hasattr(self, 'metadata_db'):
+                    self.metadata_db.log_capture(
+                        filename=detected_filename,
+                        timestamp=tnow,
+                        freq=carrier_hz,
+                        bw=bw_hz,
+                        peak=peak_db,
+                        snr=snr_db,
+                        duration=0.0
+                )
                 # Trigger ring buffer if available
-                if self.ring_buffer is not None:
-                    try:
-                        self.ring_buffer.set_trigger(center_freq=self.center_freq,carrier_hz=carrier_hz)
-                    except Exception as e:
-                        print(f"[SignalDetector] Failed to trigger ring buffer: {e}")
+                # if self.ring_buffer is not None:
+                #     try:
+                #         self.ring_buffer.set_trigger(center_freq=self.center_freq,carrier_hz=carrier_hz)
+                #     except Exception as e:
+                #         print(f"[SignalDetector] Failed to trigger ring buffer: {e}")
                 self._consec_count = 0
 
         return len(input_items[0])

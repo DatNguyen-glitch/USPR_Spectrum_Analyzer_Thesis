@@ -81,7 +81,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         #############################################################################
 
         # dwell time in milliseconds for each center frequency step
-        self.sweep_dwell_ms = 30
+        self.sweep_dwell_ms = 15
         # sweep enabled flag (toggle with checkbox)
         self.sweep_enabled = True
 
@@ -116,8 +116,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.uhd_usrp_source_0.set_center_freq(cent_freq_source, 0)
         self.uhd_usrp_source_0.set_antenna("RX2", 0)
         self.uhd_usrp_source_0.set_gain(gain_rx, 0)
-        self.uhd_usrp_source_0.set_auto_dc_offset(False, 0)
-        self.uhd_usrp_source_0.set_auto_iq_balance(False, 0)
+        self.uhd_usrp_source_0.set_auto_dc_offset(True, 0)
+        self.uhd_usrp_source_0.set_auto_iq_balance(True, 0)
         self.uhd_usrp_sink_0_0 = uhd.usrp_sink(
             ",".join(('serial=34D62A7', 'serial=34D62A7,otw_format=sc16')),
             uhd.stream_args(
@@ -279,7 +279,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
                               margin_db=30.0,
                               min_bw_hz=1e5,
                               ignore_center_bins=4,
-                              persistence_k=4,
+                              persistence_k=2,
                               out_csv="detected_signals.csv",
                               ring_buffer=self.ring_buffer)
         self.dc_blocker_xx_0 = filter.dc_blocker_cc(10, False)
@@ -364,8 +364,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
-        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
-        self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
+        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_multiply_xx_0, 0))
+        # self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
         # Connect block to device output of integrator by 50
         self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
         self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
@@ -532,28 +532,12 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 swep_cent_freq.sweeper.chunk_index = 0
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
-                self.signal_detector.set_enabled(False)
-                self.set_cent_freq_source(next_freq)
-                print(f"Sweeper: Setting center frequency to {next_freq/1e6} MHz", file=sys.stderr)
-                start_wait = time.time()
-                timeout = 0.01 
-                lo_locked = False
-                while (time.time() - start_wait) < timeout:
-                    lo_locked_sensor = self.uhd_usrp_source_0.get_sensor("lo_locked", 0)
-                    if lo_locked_sensor.to_bool():
-                        lo_locked = True
-                        break
-                    # time.sleep(0.001)
-                after_wait = time.time()
-                if lo_locked:
-                    self.signal_detector.set_enabled(True)
-                else:
-                    print(f"WARNING: PLL failed to lock at {next_freq/1e6} MHz!", file=sys.stderr)
-                    self.signal_detector.set_enabled(True)
+                self.uhd_usrp_source_0.set_center_freq(next_freq, 0)
+                self.signal_detector.set_center_freq(next_freq)
+                self.cent_freq_source = next_freq
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash
             print(f"Sweep update error: {e}", file=sys.stderr)
-            self.signal_detector.set_enabled(True)
 
     def get_sweep_enabled(self):
         return self.sweep_enabled
