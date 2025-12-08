@@ -19,7 +19,7 @@ class SignalDetector(gr.sync_block):
                  margin_db=30.0,
                  min_bw_hz=1e5,
                  ignore_center_bins=4,
-                 persistence_k=4,
+                 persistence_k=2,
                  out_csv="detected_signals.csv",
                  ring_buffer=None):
         gr.sync_block.__init__(self,
@@ -54,7 +54,7 @@ class SignalDetector(gr.sync_block):
             self._csv_file_handle = None
 
         self._blanking_samples = 0
-        self.BLANK_VEC_COUNT = 50
+        self.BLANK_VEC_COUNT = 80
         self.enabled = True
         # Hanning Window 5 tap or Moving Average smoothing the noise
         self.smooth_window = np.ones(5) / 5.0
@@ -82,19 +82,23 @@ class SignalDetector(gr.sync_block):
         return float(np.median(psd_db))
 
     def find_clusters(self, mask):
-        clusters = []
-        N = len(mask)
-        i = 0
-        while i < N:
-            if mask[i]:
-                j = i
-                while j+1 < N and mask[j+1]:
-                    j += 1
-                clusters.append((i, j)) # i = start of a cluster, j = end of a cluster
-                i = j+1
-            else:
-                i += 1
-        return clusters
+        """Vectorized cluster finding - much faster than Python loops."""
+        if not np.any(mask):
+            return []
+        
+        # Pad with False at both ends to detect edges properly
+        padded = np.concatenate(([False], mask, [False]))
+        
+        # Find where values change (edges)
+        diff = np.diff(padded.astype(np.int8))
+        
+        # Rising edges (0->1) mark cluster starts
+        starts = np.where(diff == 1)[0]
+        # Falling edges (1->0) mark cluster ends (subtract 1 for inclusive end)
+        ends = np.where(diff == -1)[0] - 1
+        
+        # Return as list of tuples for compatibility
+        return list(zip(starts, ends))
 
     def compute_freq_for_bin(self, k):
         return self.center_freq - (self.fs/2.0) + k * self.df
@@ -107,10 +111,16 @@ class SignalDetector(gr.sync_block):
     def work(self, input_items, output_items):
         if not self.enabled:
             return len(input_items[0])
+        
+        process_start_time = time.time()
+        capture_time_sec = None
         invecs = input_items[0]
         n_items = len(invecs)
         
+        # Gather tags in this window. We build a map of absolute tag offsets -> timestamp
+        # so we can compute an accurate receive time for each vector item.
         tags = self.get_tags_in_window(0, 0, n_items)
+        tag_time_map = {}
         for tag in tags:
             key = pmt.to_python(tag.key)
             if key == 'rx_freq':
@@ -118,9 +128,34 @@ class SignalDetector(gr.sync_block):
                 if abs(new_freq - self.center_freq) > 1.0:
                     print(f"[Sync] Freq changed to {new_freq/1e6:.1f} MHz based on Tag")
                     self.center_freq = new_freq
-                    self.center_freq = new_freq
                     self._consec_count = 0
                     self._blanking_samples = self.BLANK_VEC_COUNT
+
+            if key == 'rx_time':
+                # tag.offset is the absolute item offset where this timestamp applies
+                try:
+                    tag_offset = int(pmt.to_python(tag.offset))
+                except Exception:
+                    # Fallback: treat tag as applying to start of window
+                    tag_offset = None
+                timestamp = pmt.to_python(tag.value)
+                try:
+                    tag_time = float(timestamp[0]) + float(timestamp[1])
+                except Exception:
+                    # If timestamp is a single value
+                    tag_time = float(timestamp)
+                if tag_offset is not None:
+                    tag_time_map[tag_offset] = tag_time
+                else:
+                    # store as capture_time_sec fallback
+                    capture_time_sec = tag_time
+
+        # Determine absolute index of the first item in this window
+        try:
+            window_start = int(self.nitems_read(0))
+        except Exception:
+            # Fallback if method not available
+            window_start = 0
 
         for i in range(n_items):
             if self._blanking_samples > 0:
@@ -128,8 +163,9 @@ class SignalDetector(gr.sync_block):
                 continue
 
             raw_psd_db = invecs[i]
-            psd_db = np.convolve(raw_psd_db, self.smooth_window, mode='same')
-            psd_db = np.array(psd_db, dtype=np.float32)
+            # psd_db = np.convolve(raw_psd_db, self.smooth_window, mode='same')
+            # Use asarray to avoid copy if already correct type (input is already float32)
+            psd_db = np.asarray(raw_psd_db, dtype=np.float32)
 
             if self.ignore_center > 0:
                 center = self.N // 2
@@ -184,7 +220,28 @@ class SignalDetector(gr.sync_block):
                 if self.ring_buffer:
                     self.ring_buffer.set_trigger(center_freq=self.center_freq, carrier_hz=carrier_hz)
                     detected_filename = self.ring_buffer.current_filename
-                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz | File: {os.path.basename(detected_filename)}", flush=True)
+                
+                process_end_time = time.time()
+                latency_ms = 0.0
+                # Compute receive time for this vector item. Prefer tag-based per-offset timing.
+                receive_time = None
+                if tag_time_map:
+                    # Find the most recent tag offset <= this absolute item index
+                    abs_index = window_start + i
+                    candidate_offsets = [off for off in tag_time_map.keys() if off <= abs_index]
+                    if candidate_offsets:
+                        chosen_off = max(candidate_offsets)
+                        base_time = tag_time_map[chosen_off]
+                        # number of vectors since tag
+                        vecs_since_tag = abs_index - chosen_off
+                        # time per vector = N samples / fs
+                        receive_time = base_time + (vecs_since_tag * (self.N / float(self.fs)))
+                if receive_time is None and capture_time_sec:
+                    receive_time = capture_time_sec
+
+                if receive_time:
+                    latency_ms = (process_end_time - receive_time) * 1000.0
+                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz | Latency: {latency_ms:.2f}ms | File: {os.path.basename(detected_filename)}", flush=True)
                 # --- METADATA CAPTURE ---
                 if hasattr(self, 'metadata_db'):
                     self.metadata_db.log_capture(
