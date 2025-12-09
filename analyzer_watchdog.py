@@ -13,6 +13,9 @@ RESULT_DIR = "./results"        # Directory to save result images
 SAMPLE_RATE = 50e6              # 50 MSps
 FFT_SIZE = 65536                # High resolution (64k points)
 SCALING_FACTOR = 131072.0       # Scaling factor (must match the multiplier in ring_buffer)
+MARGIN_DB = 15.0                # Detection margin above median noise for peak finding
+MIN_BW_HZ = 50000.0             # Minimum expected signal bandwidth (50 kHz)
+PEAK_SEPARATION_HZ = 1e6        # Required minimum separation between reported peaks (Hz)
 
 # Backend 'Agg' to run in background, no popup window
 plt.switch_backend('Agg')
@@ -140,21 +143,67 @@ def process_and_cleanup(filepath, filename):
         # Actual frequencies
         real_freqs_mhz = (freqs + center_freq) / 1e6
 
-        # Find peak
-        peak_idx = np.argmax(psd_db)
-        peak_freq = real_freqs_mhz[peak_idx]
-        peak_pwr = psd_db[peak_idx]
+        # Multi-peak detection
+        df = SAMPLE_RATE / float(FFT_SIZE)
+
+        # Enforce a minimum peak separation in Hz, but clamp to the sampled bandwidth
+        requested_sep_hz = float(PEAK_SEPARATION_HZ)
+        if requested_sep_hz > SAMPLE_RATE:
+            # Can't separate peaks by more than the capture bandwidth — clamp and warn
+            print(f"    -> Requested peak separation {requested_sep_hz:.0f} Hz exceeds SAMPLE_RATE={SAMPLE_RATE:.0f} Hz; clamping to SAMPLE_RATE.")
+            sep_hz = SAMPLE_RATE
+        else:
+            sep_hz = requested_sep_hz
+
+        # Compute required bin distance for both minimum bandwidth and separation rules
+        min_bins_bw = max(1, int(np.ceil(MIN_BW_HZ / df)))
+        min_bins_sep = max(1, int(np.ceil(sep_hz / df)))
+        min_bins = max(min_bins_bw, min_bins_sep)
+
+        noise_floor = np.median(psd_db)
+        threshold_db = noise_floor + MARGIN_DB
+
+        # Find peaks above threshold and separated by at least `min_bins` bins
+        peak_indices, peak_props = signal.find_peaks(psd_db, height=threshold_db, distance=min_bins)
+
+        # If no peaks found, prepare to evaluate the single highest peak for width
+        if peak_indices.size == 0:
+            peak_indices = np.array([int(np.argmax(psd_db))])
+
+        # Compute widths (in bins) for peaks to estimate bandwidth (approx -3dB width)
+        if peak_indices.size > 0:
+            results_half = signal.peak_widths(psd_db, peak_indices, rel_height=0.5)
+            widths_bins = results_half[0]
+        else:
+            widths_bins = np.array([])
+
+        # Filter peaks by minimum considered bandwidth: only keep peaks with width >= 50 kHz
+        MIN_CONSIDER_BW_HZ = 50000.0
+        peaks = []
+        for idx, wbin in zip(peak_indices, widths_bins):
+            width_hz = float(wbin) * df
+            if width_hz >= MIN_CONSIDER_BW_HZ:
+                peaks.append((int(idx), float(psd_db[int(idx)]), width_hz))
 
         # 5. Plot and save image
         plt.figure(figsize=(10, 5))
         plt.plot(real_freqs_mhz, psd_db, color='#004488', linewidth=0.6)
-        plt.title(f"Spectrum Analysis: {filename}\nPeak: {peak_freq:.4f} MHz ({peak_pwr:.2f} dB)")
+        title_peaks = ", ".join([f"{(real_freqs_mhz[pidx]):.4f} MHz ({pwr:.1f} dB)" for pidx, pwr, _ in peaks])
+        plt.title(f"Spectrum Analysis: {filename}\nPeaks: {title_peaks}")
         plt.xlabel("Frequency (MHz)")
         plt.ylabel("Amplitude (dB)")
         plt.grid(True, alpha=0.5)
         
-        # Mark the peak
-        plt.plot(peak_freq, peak_pwr, 'rx')
+        # Mark each detected peak and annotate bandwidth estimate
+        for (pidx, pwr, width_hz) in peaks:
+            pfreq = real_freqs_mhz[pidx]
+            plt.plot(pfreq, pwr, 'rx')
+            # annotate with the computed width in kHz
+            try:
+                plt.annotate(f"{pfreq:.4f} MHz\n{pwr:.1f} dB\nBW~{width_hz/1e3:.1f} kHz",
+                             xy=(pfreq, pwr), xytext=(5, 5), textcoords='offset points', fontsize=8, color='red')
+            except Exception:
+                pass
         
         # Determine results subfolder by capture date (parent folder name), fallback to file mtime
         try:
