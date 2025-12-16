@@ -67,7 +67,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.vec_len = vec_len = 2048
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
         self.samp_rate = samp_rate = 5e7
-        self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0 = firdes.low_pass(1.0, samp_rate, 2.25e7,1e6, window.WIN_HAMMING, 6.76)
+        self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0 = firdes.low_pass(1.0, samp_rate, samp_rate/2 * 0.9,1e6, window.WIN_HAMMING, 6.76)
         self.qpsk = qpsk = digital.constellation_rect([-1-1j, -1+1j, 1+1j, 1-1j], [0, 1, 3, 2],
         4, 2, 2, 1, 1).base()
         self.noise = noise = 0
@@ -75,13 +75,14 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.gain_rx = gain_rx = 22
         self.fft_len = fft_len = 2048
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
-        self.cent_freq_source = cent_freq_source = 1e8
+        # self.cent_freq_source = cent_freq_source = samp_rate/2 * 0.9  # start at minimum frequency
+        self.cent_freq_source = cent_freq_source = 5e8
         ############## IMPORTANT: antenna must support this frequency! ##############
         self.cent_freq_sink = cent_freq_sink = 5.1e8   # IMPORTANT: antenna must support this frequency!
         #############################################################################
 
         # dwell time in milliseconds for each center frequency step
-        self.sweep_dwell_ms = 15
+        self.sweep_dwell_ms = 20
         # sweep enabled flag (toggle with checkbox)
         self.sweep_enabled = True
 
@@ -102,7 +103,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._cent_freq_source_win = qtgui.RangeWidget(self._cent_freq_source_range, self.set_cent_freq_source, "'cent_freq_source'", "counter_slider", float, QtCore.Qt.Horizontal)
         self.top_layout.addWidget(self._cent_freq_source_win)
         self.uhd_usrp_source_0 = uhd.usrp_source(
-            ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=32','recv_frame_size=8200')),
+            ",".join(('serial=34D628E', 'lo_offset=6e6','num_recv_frames=128','recv_frame_size=8200')),
             uhd.stream_args(
                 cpu_format="fc32",
                 otw_format="sc16",
@@ -111,6 +112,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
             ),
         )
         self.uhd_usrp_source_0.set_samp_rate(samp_rate)
+        self.uhd_usrp_source_0.set_time_now(uhd.time_spec(time.time()), 0)
         # No synchronization enforced.
 
         self.uhd_usrp_source_0.set_center_freq(cent_freq_source, 0)
@@ -276,8 +278,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.signal_detector = SignalDetector(vec_len=self.vec_len,
                               samp_rate=self.samp_rate,
                               center_freq=self.cent_freq_source,
-                              margin_db=30.0,
-                              min_bw_hz=1e5,
+                              margin_db=20.0,
+                              min_bw_hz=5e4,
                               ignore_center_bins=4,
                               persistence_k=2,
                               out_csv="detected_signals.csv",
@@ -288,7 +290,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.blocks_stream_to_vector_1 = blocks.stream_to_vector(gr.sizeof_float*1, vec_len)
         self.blocks_nlog10_ff_0 = blocks.nlog10_ff(10, vec_len, (-100))
         self.blocks_keep_one_in_n_0 = blocks.keep_one_in_n(gr.sizeof_gr_complex*vec_len, (round(samp_rate/fft_len/1000)))
-        self.blocks_keep_one_in_n_1 = blocks.keep_one_in_n(gr.sizeof_float*vec_len, 5)
+        self.blocks_keep_one_in_n_1 = blocks.keep_one_in_n(gr.sizeof_float*self.vec_len, 20)
         self.blocks_integrate_xx_0 = blocks.integrate_ff(10, vec_len)
         self.blocks_complex_to_mag_squared_0 = blocks.complex_to_mag_squared(vec_len)
         self.blocks_add_xx_0_0 = blocks.add_vcc(1)
@@ -326,53 +328,27 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
         self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
-        self.connect((self.blocks_add_xx_0_0, 0), (self.low_pass_filter_0, 0))
-        self.connect((self.low_pass_filter_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        # self.connect((self.blocks_add_xx_0_0, 0), (self.low_pass_filter_0, 0))
+        # self.connect((self.low_pass_filter_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
         # self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
-        
-        
-        
-        ### Connect log10 block directly after log10
-        # self.connect((self.epy_block_0, 0), (self.qtgui_vector_sink_f_0, 0))
-        ### end median block connection
 
-        ####### ----------------- Signal Detection Chain ----------------- #######
-        # self.connect((self.uhd_usrp_source_0, 0), (self.freq_xlating_fir_filter_xxx_0, 0))
-        # self.connect((self.freq_xlating_fir_filter_xxx_0, 0), (self.dc_blocker_xx_0, 0))
-        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
-        # self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
-        # # self.connect((self.blocks_stream_to_vector_0, 0), (self.blocks_keep_one_in_n_0, 0))
-        # self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
-        # # self.connect((self.blocks_keep_one_in_n_0, 0), (self.fft_vxx_0, 0))
-        # self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
-        # self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_integrate_xx_0, 0))
-        # self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
-        # # Connect block to device output of integrator by 100
-        # self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
-        # self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
-        # # After multiplication, connect to log10
-        # self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
-        # # feed PSD (dB) to both detector and vector sink
-        # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
-        # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
+
         ####### ----------------- RAW Signal Detection Chain ----------------- #######
-        self.connect((self.uhd_usrp_source_0, 0), (self.low_pass_filter_1, 0))
-        self.connect((self.low_pass_filter_1, 0), (self.dc_blocker_xx_0, 0))
+        # self.connect((self.uhd_usrp_source_0, 0), (self.low_pass_filter_1, 0))
+        self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
         # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
         # Connect RX IQ stream to ring_buffer for event capture
-        self.connect((self.dc_blocker_xx_0, 0), (self.ring_buffer, 0))
+        # self.connect((self.dc_blocker_xx_0, 0), (self.ring_buffer, 0))
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
-        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_multiply_xx_0, 0))
-        # self.connect((self.blocks_integrate_xx_0, 0), (self.blocks_multiply_xx_0, 0))
-        # Connect block to device output of integrator by 50
-        self.connect((self.analog_const_source_x_0, 0), (self.blocks_stream_to_vector_1, 0))
-        self.connect((self.blocks_stream_to_vector_1, 0), (self.blocks_multiply_xx_0, 1))
-        # After multiplication, connect to log10
-        self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_nlog10_ff_0, 0))
+        self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_nlog10_ff_0, 0))
         # feed PSD (dB) to both detector and vector sink
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
+        self.connect((self.blocks_nlog10_ff_0, 0), (self.blocks_keep_one_in_n_1, 0))
+        self.connect((self.blocks_keep_one_in_n_1, 0), (self.signal_detector, 0))
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
+        # self.connect((self.blocks_keep_one_in_n_1, 0), (self.qtgui_vector_sink_f_0, 0))
         # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
 
         # start a timer to step the center frequency (sweep)
@@ -456,7 +432,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
     def set_samp_rate(self, samp_rate):
         self.samp_rate = samp_rate
         self.blocks_keep_one_in_n_0.set_n((round(self.samp_rate/self.fft_len/1000)))
-        self.blocks_keep_one_in_n_1.set_n(5)
+        self.blocks_keep_one_in_n_1.set_n(20)
         self.qtgui_freq_sink_x_0.set_frequency_range(self.cent_freq_source, self.samp_rate)
         self.low_pass_filter_0.set_taps(firdes.low_pass(1, self.samp_rate, 22.5e6, 1.5e6, window.WIN_HAMMING, 6.76))
         self.qtgui_freq_sink_x_0_0.set_frequency_range(self.cent_freq_sink, self.samp_rate)
@@ -464,7 +440,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.uhd_usrp_source_0.set_samp_rate(self.samp_rate)
         if hasattr(self, 'signal_detector'):
             try:
-                self.signal_detector.set_samp_rate(self.samp_rate)
+                self.signal_detector.set_samp_rate(self.samp_rate/20)
             except Exception:
                 pass
 

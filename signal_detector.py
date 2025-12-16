@@ -54,10 +54,11 @@ class SignalDetector(gr.sync_block):
             self._csv_file_handle = None
 
         self._blanking_samples = 0
-        self.BLANK_VEC_COUNT = 80
+        self.BLANK_VEC_COUNT = 4
         self.enabled = True
         # Hanning Window 5 tap or Moving Average smoothing the noise
         self.smooth_window = np.ones(5) / 5.0
+        self.SKIP_FACTOR = 25
 
     def set_center_freq(self, f_hz):
         pass
@@ -117,6 +118,13 @@ class SignalDetector(gr.sync_block):
         invecs = input_items[0]
         n_items = len(invecs)
         
+        # Determine absolute index of the first item in this window
+        try:
+            window_start = int(self.nitems_read(0))
+        except Exception:
+            # Fallback if method not available
+            window_start = 0
+        # print("nitems_read:", self.nitems_read(0), "n_items:", n_items, "window_start:", window_start)
         # Gather tags in this window. We build a map of absolute tag offsets -> timestamp
         # so we can compute an accurate receive time for each vector item.
         tags = self.get_tags_in_window(0, 0, n_items)
@@ -134,7 +142,8 @@ class SignalDetector(gr.sync_block):
             if key == 'rx_time':
                 # tag.offset is the absolute item offset where this timestamp applies
                 try:
-                    tag_offset = int(pmt.to_python(tag.offset))
+                    # tag_offset = int(pmt.to_python(tag.offset))
+                    tag_offset = int(tag.offset)
                 except Exception:
                     # Fallback: treat tag as applying to start of window
                     tag_offset = None
@@ -150,16 +159,18 @@ class SignalDetector(gr.sync_block):
                     # store as capture_time_sec fallback
                     capture_time_sec = tag_time
 
-        # Determine absolute index of the first item in this window
-        try:
-            window_start = int(self.nitems_read(0))
-        except Exception:
-            # Fallback if method not available
-            window_start = 0
+        # # Determine absolute index of the first item in this window
+        # try:
+        #     window_start = int(self.nitems_read(0))
+        # except Exception:
+        #     # Fallback if method not available
+        #     window_start = 0
 
-        for i in range(n_items):
+        for i in range(0, n_items, self.SKIP_FACTOR):
             if self._blanking_samples > 0:
-                self._blanking_samples -= 1     # blank for 10 samples after freq change
+                self._blanking_samples -= self.SKIP_FACTOR
+                if self._blanking_samples < 0: 
+                    self._blanking_samples = 0
                 continue
 
             raw_psd_db = invecs[i]
@@ -241,7 +252,7 @@ class SignalDetector(gr.sync_block):
 
                 if receive_time:
                     latency_ms = (process_end_time - receive_time) * 1000.0
-                print(f"[SignalDetector] DETECT @ {carrier_hz/1e6:.6f} MHz | Latency: {latency_ms:.2f}ms | File: {os.path.basename(detected_filename)}", flush=True)
+                print(f"[SignalDetector nitems_read: {self.nitems_read(0)} - items: {window_start + i}] DETECT @ {carrier_hz/1e6:.6f} MHz | Latency: {latency_ms:.2f}ms | File: {os.path.basename(detected_filename)}", flush=True)
                 # --- METADATA CAPTURE ---
                 if hasattr(self, 'metadata_db'):
                     self.metadata_db.log_capture(
