@@ -19,8 +19,8 @@ from gnuradio import eng_notation
 from gnuradio import uhd
 import time
 import signal_detection_swep_cent_freq as swep_cent_freq  # embedded python module
-from signal_detector import SignalDetector # embedded python module
-from ring_buffer import ring_buffer
+# from signal_detector import SignalDetector # embedded python module
+from gnuradio import specdetect  # OOT C++ block
 import sip
 import csv, threading
 import numpy as np
@@ -84,7 +84,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         # dwell time in milliseconds for each center frequency step
         self.sweep_dwell_ms = 20
         # sweep enabled flag (toggle with checkbox)
-        self.sweep_enabled = True
+        self.sweep_enabled = False
 
         ##################################################
         # Blocks
@@ -272,18 +272,20 @@ class signal_detection(gr.top_block, Qt.QWidget):
             verbose=False,
             log=False,
             truncate=False)
-        # self.epy_block_0 = epy_block_0.blk(vec_len=2048, threshold_dB=10.0)  # embedded python block
-        # instantiate ring_buffer and SignalDetector, and connect them
-        self.ring_buffer = ring_buffer(samp_rate=self.samp_rate, buffer_ms=1, post_ms=1)
-        self.signal_detector = SignalDetector(vec_len=self.vec_len,
-                              samp_rate=self.samp_rate,
-                              center_freq=self.cent_freq_source,
-                              margin_db=20.0,
-                              min_bw_hz=5e4,
-                              ignore_center_bins=4,
-                              persistence_k=2,
-                              out_csv="detected_signals.csv",
-                              ring_buffer=self.ring_buffer)
+        self.spectrum_detector = specdetect.spectrumDetector(
+            vec_len,
+            samp_rate,
+            50.0,
+            5e4
+        )
+        # self.signal_detector = SignalDetector(vec_len=self.vec_len,
+        #               samp_rate=self.samp_rate,
+        #               center_freq=self.cent_freq_source,
+        #               margin_db=20.0,
+        #               min_bw_hz=5e4,
+        #               ignore_center_bins=4,
+        #               persistence_k=2,
+        #               ring_buffer=None)
         self.dc_blocker_xx_0 = filter.dc_blocker_cc(10, False)
         self.blocks_correctiq_0 = blocks.correctiq()
         self.blocks_stream_to_vector_0 = blocks.stream_to_vector(gr.sizeof_gr_complex*1, vec_len)
@@ -328,33 +330,25 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
         self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
         self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
-        # self.connect((self.blocks_add_xx_0_0, 0), (self.low_pass_filter_0, 0))
-        # self.connect((self.low_pass_filter_0, 0), (self.uhd_usrp_sink_0_0, 0))
         self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
         # self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
 
 
         ####### ----------------- RAW Signal Detection Chain ----------------- #######
-        # self.connect((self.uhd_usrp_source_0, 0), (self.low_pass_filter_1, 0))
         self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
         # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
-        # Connect RX IQ stream to ring_buffer for event capture
-        # self.connect((self.dc_blocker_xx_0, 0), (self.ring_buffer, 0))
         self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
         self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_nlog10_ff_0, 0))
         # feed PSD (dB) to both detector and vector sink
         self.connect((self.blocks_nlog10_ff_0, 0), (self.blocks_keep_one_in_n_1, 0))
-        self.connect((self.blocks_keep_one_in_n_1, 0), (self.signal_detector, 0))
+        self.connect((self.blocks_keep_one_in_n_1, 0), (self.spectrum_detector, 0))
         # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
-        # self.connect((self.blocks_keep_one_in_n_1, 0), (self.qtgui_vector_sink_f_0, 0))
+        self.connect((self.blocks_keep_one_in_n_1, 0), (self.qtgui_vector_sink_f_0, 0))
         # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
 
         # start a timer to step the center frequency (sweep)
-        # self._sweep_timer = Qt.QTimer(self)
-        # self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
-        # self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
         # Add a simple checkbox to enable/disable sweeping
         self._sweep_checkbox = Qt.QCheckBox("Enable sweep")
         self._sweep_checkbox.setChecked(self.sweep_enabled)
@@ -509,7 +503,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
                 self.uhd_usrp_source_0.set_center_freq(next_freq, 0)
-                self.signal_detector.set_center_freq(next_freq)
+                # self.signal_detector.set_center_freq(next_freq)
                 self.cent_freq_source = next_freq
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash
