@@ -24,6 +24,7 @@ from gnuradio import specdetect  # OOT C++ block
 import sip
 import csv, threading
 import numpy as np
+import pmt
 
 
 class signal_detection(gr.top_block, Qt.QWidget):
@@ -61,10 +62,10 @@ class signal_detection(gr.top_block, Qt.QWidget):
         ##################################################
         # Variables
         ##################################################
-        self.overlap = overlap = 1e-1
+        self.overlap = overlap = 2e-1
         self.chunk_bw = chunk_bw = 5e7
         self.step = step = chunk_bw*(1-overlap)
-        self.vec_len = vec_len = 2048
+        self.vec_len = vec_len = 1024
         self.total_chunk = total_chunk = round( ((1e9-chunk_bw)/step) + 1 )
         self.samp_rate = samp_rate = 5e7
         self.variable_low_pass_filter_taps_0 = variable_low_pass_filter_taps_0 = firdes.low_pass(1.0, samp_rate, samp_rate/2 * 0.9,1e6, window.WIN_HAMMING, 6.76)
@@ -73,7 +74,7 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.noise = noise = 0
         self.gain_tx = gain_tx = 22
         self.gain_rx = gain_rx = 22
-        self.fft_len = fft_len = 2048
+        self.fft_len = fft_len = 1024
         # self.cent_freq_source = cent_freq_source = swep_cent_freq.sweeper.next(step)
         # self.cent_freq_source = cent_freq_source = samp_rate/2 * 0.9  # start at minimum frequency
         self.cent_freq_source = cent_freq_source = 5e8
@@ -84,7 +85,9 @@ class signal_detection(gr.top_block, Qt.QWidget):
         # dwell time in milliseconds for each center frequency step
         self.sweep_dwell_ms = 20
         # sweep enabled flag (toggle with checkbox)
-        self.sweep_enabled = False
+        self.sweep_enabled = True
+        # for sweep debug timing (monotonic, ms)
+        self._sweep_t0_ns = time.monotonic_ns()
 
         ##################################################
         # Blocks
@@ -130,6 +133,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
             ),
             "",
         )
+        self.blocks_file_source_1 = blocks.file_source(gr.sizeof_gr_complex*1, '/home/datnguyen/Desktop/data.complex_float', True, 0, 0)
+        self.blocks_file_source_1.set_begin_tag(pmt.PMT_NIL)
         self.uhd_usrp_sink_0_0.set_samp_rate(2e6)
         # No synchronization enforced.
 
@@ -275,8 +280,8 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.spectrum_detector = specdetect.spectrumDetector(
             vec_len,
             samp_rate,
-            50.0,
-            5e4
+            25.0,
+            3e4
         )
         # self.signal_detector = SignalDetector(vec_len=self.vec_len,
         #               samp_rate=self.samp_rate,
@@ -327,25 +332,28 @@ class signal_detection(gr.top_block, Qt.QWidget):
         # Connections
         ##################################################
 
-        self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
-        self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
-        self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
-        self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        # self.connect((self.analog_noise_source_x_0_0, 0), (self.blocks_add_xx_0_0, 1))
+        # self.connect((self.analog_random_source_x_0_0, 0), (self.digital_constellation_modulator_0_0, 0))
+        # self.connect((self.digital_constellation_modulator_0_0, 0), (self.blocks_add_xx_0_0, 0))
+        # self.connect((self.blocks_add_xx_0_0, 0), (self.uhd_usrp_sink_0_0, 0))
+        # self.connect((self.blocks_file_source_1, 0), (self.qtgui_freq_sink_x_0_0, 0))
+        self.connect((self.blocks_file_source_1, 0), (self.uhd_usrp_sink_0_0, 0))
         # self.connect((self.low_pass_filter_0, 0), (self.qtgui_freq_sink_x_0_0, 0))        # visualize TX signal
 
 
         ####### ----------------- RAW Signal Detection Chain ----------------- #######
-        self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
-        # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
-        self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
+        # self.connect((self.uhd_usrp_source_0, 0), (self.dc_blocker_xx_0, 0))
+        # # self.connect((self.dc_blocker_xx_0, 0), (self.qtgui_freq_sink_x_0, 0))            # visualize RX signal
+        # self.connect((self.dc_blocker_xx_0, 0), (self.blocks_stream_to_vector_0, 0))
+        self.connect((self.uhd_usrp_source_0, 0), (self.blocks_stream_to_vector_0, 0))
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.blocks_complex_to_mag_squared_0, 0))
         self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_nlog10_ff_0, 0))
-        # feed PSD (dB) to both detector and vector sink
-        self.connect((self.blocks_nlog10_ff_0, 0), (self.blocks_keep_one_in_n_1, 0))
-        self.connect((self.blocks_keep_one_in_n_1, 0), (self.spectrum_detector, 0))
+        # self.connect((self.blocks_nlog10_ff_0, 0), (self.blocks_keep_one_in_n_1, 0))
+        self.connect((self.blocks_nlog10_ff_0, 0), (self.spectrum_detector, 0))
+        # self.connect((self.blocks_keep_one_in_n_1, 0), (self.spectrum_detector, 0))
         # self.connect((self.blocks_nlog10_ff_0, 0), (self.signal_detector, 0))
-        self.connect((self.blocks_keep_one_in_n_1, 0), (self.qtgui_vector_sink_f_0, 0))
+        # self.connect((self.blocks_keep_one_in_n_1, 0), (self.qtgui_vector_sink_f_0, 0))
         # self.connect((self.blocks_nlog10_ff_0, 0), (self.qtgui_vector_sink_f_0, 0))
 
         # start a timer to step the center frequency (sweep)
@@ -355,10 +363,14 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self._sweep_checkbox.stateChanged.connect(lambda s: self.set_sweep_enabled(s == QtCore.Qt.Checked))
         self.top_layout.addWidget(self._sweep_checkbox)
 
-        self._sweep_timer = Qt.QTimer(self)
-        self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
+        # self._sweep_timer = Qt.QTimer(self)
+        # self._sweep_timer.timeout.connect(self._update_sweep_center_freq)
+        # if self.sweep_enabled:
+        #     self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
+        self.sweep_thread_running = False
+        self.sweep_thread = None
         if self.sweep_enabled:
-            self._sweep_timer.start(self.sweep_dwell_ms)  # interval in ms; adjust as needed
+            self.start_sweep_thread()
 
     def closeEvent(self, event):
         self.settings = Qt.QSettings("GNU Radio", "signal_detection")
@@ -366,6 +378,11 @@ class signal_detection(gr.top_block, Qt.QWidget):
         try:
             if hasattr(self, "_sweep_timer") and self._sweep_timer.isActive():
                 self._sweep_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "stop_sweep_thread"):
+                self.stop_sweep_thread()
         except Exception:
             pass
         self.stop()
@@ -502,12 +519,28 @@ class signal_detection(gr.top_block, Qt.QWidget):
                 swep_cent_freq.sweeper.chunk_index = 0
                 next_freq = swep_cent_freq.sweeper.next(self.step)
             if next_freq is not None:
-                self.uhd_usrp_source_0.set_center_freq(next_freq, 0)
+                now_ns = time.monotonic_ns()
+                elapsed_ms = (now_ns - getattr(self, "_sweep_t0_ns", now_ns)) / 1e6
+                # print(f"[SWEEP] t={elapsed_ms:.3f} ms, next_freq={next_freq/1e6:.6f} MHz", flush=True)
+                tune_req = uhd.tune_request(next_freq, 18.0e6) 
+                # Optimize tune speed for USRP B2xx
+                tune_req.rf_freq_policy = uhd.tune_request.POLICY_AUTO
+                tune_req.dsp_freq_policy = uhd.tune_request.POLICY_AUTO
+                self.uhd_usrp_source_0.set_center_freq(tune_req, 0)
                 # self.signal_detector.set_center_freq(next_freq)
                 self.cent_freq_source = next_freq
+                # Update GUI display from the Qt thread (do not re-tune here)
+                QtCore.QTimer.singleShot(0, lambda f=next_freq: self._on_sweep_freq_changed(f))
         except Exception as e:
             # swallow exceptions from sweeper to avoid timer crash
             print(f"Sweep update error: {e}", file=sys.stderr)
+
+    def _on_sweep_freq_changed(self, freq):
+        try:
+            self.cent_freq_source = freq
+            # self.qtgui_freq_sink_x_0.set_frequency_range(self.cent_freq_source, self.samp_rate)
+        except Exception:
+            pass
 
     def get_sweep_enabled(self):
         return self.sweep_enabled
@@ -517,14 +550,53 @@ class signal_detection(gr.top_block, Qt.QWidget):
         self.sweep_enabled = bool(enabled)
         try:
             if self.sweep_enabled:
-                if not self._sweep_timer.isActive():
-                    self._sweep_timer.start(self.sweep_dwell_ms)
+                # if not self._sweep_timer.isActive():
+                #     self._sweep_timer.start(self.sweep_dwell_ms)
+                self.start_sweep_thread()
             else:
-                if self._sweep_timer.isActive():
-                    self._sweep_timer.stop()
+                # if self._sweep_timer.isActive():
+                #     self._sweep_timer.stop()
+                self.stop_sweep_thread()
         except Exception:
             pass
 
+    def start_sweep_thread(self):
+        if self.sweep_thread_running:
+            return
+        
+        self.sweep_thread_running = True
+        # target=self._sweep_loop is the infinite loop function defined below
+        self.sweep_thread = threading.Thread(target=self._sweep_loop)
+        self.sweep_thread.daemon = True # Daemon thread stops when the main program exits
+        self.sweep_thread.start()
+
+    def stop_sweep_thread(self):
+        self.sweep_thread_running = False
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            timeout_s = max(0.5, (self.sweep_dwell_ms / 1000.0) + 0.5)
+            self.sweep_thread.join(timeout=timeout_s)
+
+    def _sweep_loop(self):
+        while self.sweep_thread_running:
+            # Record cycle start time
+            start_time = time.monotonic()
+
+            # Perform frequency hop (calls your existing function)
+            # Note: this calls usrp.set_center_freq; this is thread-safe in GNU Radio
+            self._update_sweep_center_freq()
+
+            # Compute time spent hopping/tuning
+            elapsed_sec = time.monotonic() - start_time
+            
+            # Compute sleep time to enforce the configured dwell time
+            # sleep_time = (20 ms) - (time spent tuning)
+            wait_time = (self.sweep_dwell_ms / 1000.0) - elapsed_sec
+
+            if wait_time > 0:
+                time.sleep(wait_time)
+            else:
+                # If tuning takes >20 ms (e.g., overrun), skip sleep and continue immediately
+                pass
 
 def main(top_block_cls=signal_detection, options=None):
 
