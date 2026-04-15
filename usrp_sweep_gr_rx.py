@@ -27,7 +27,7 @@ RX_START_HZ = 90e6
 RX_STOP_HZ = 1e9
 RX_STEP_HZ = 40e6
 RX_INIT_HZ = 4e8
-RX_WARMUP_HZ = 9e8
+RX_WARMUP_HZ = 5e8
 RX_WARMUP_DELAY_S = 0.1
 RX_WARMUP_HOLD_S = 0.1
 RX_FINAL_HZ = 5e8
@@ -240,7 +240,7 @@ class FrameProcessor(gr.sync_block):
             if signals:
                 for sig in signals:
                     log(
-                        "[RX] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
+                        "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
                         "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
                         "g_argmax_bin={} | g_argmax_freq={:.3f} MHz".format(
                             tune_id,
@@ -288,8 +288,8 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_center_freq(self.center_hz, 0)
         self.usrp_source.set_antenna("RX2", 0)
         self.usrp_source.set_gain(RX_GAIN_DB, 0)
-        self.usrp_source.set_auto_dc_offset(False, 0)
-        self.usrp_source.set_auto_iq_balance(False, 0)
+        self.usrp_source.set_auto_dc_offset(True, 0)
+        self.usrp_source.set_auto_iq_balance(True, 0)
         self.usrp_source.set_rx_agc(False, 0)
 
         self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex * 1, FFT_LEN)
@@ -338,21 +338,30 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
     loop_idx = 0
     prev_tune_ts = time.perf_counter()
     while not stop_event.is_set():
-        sleep_start = time.perf_counter()
-        time.sleep(dwell_s)
-        sleep_end = time.perf_counter()
+        tune_start = time.perf_counter()                                                                                                                                                            
+        tb.set_center_freq(center_hz)                                                                                                                                                               
+        tune_end = time.perf_counter()
+                                                                                                                                                                                                    
+        remaining_s = dwell_s - (tune_end - tune_start)                                                                                                                                             
+        if remaining_s > 0:
+            time.sleep(remaining_s) 
+
+        # sleep_start = time.perf_counter()
+        # time.sleep(dwell_s)
+        # sleep_end = time.perf_counter()
 
         center_hz += RX_STEP_HZ
         if center_hz > RX_STOP_HZ:
             center_hz = RX_START_HZ
 
-        tune_start = time.perf_counter()
-        tb.set_center_freq(center_hz)
-        tune_end = time.perf_counter()
+        # tune_start = time.perf_counter()
+        # tb.set_center_freq(center_hz)
+        # tune_end = time.perf_counter()
 
         loop_idx += 1
         if MEASURE_SWEEP_TIMING and (loop_idx % max(1, SWEEP_TIMING_LOG_EVERY) == 0):
-            sleep_ms = (sleep_end - sleep_start) * 1000.0
+            # sleep_ms = (sleep_end - sleep_start) * 1000.0
+            sleep_ms = 0
             tune_ms = (tune_end - tune_start) * 1000.0
             interval_ms = (tune_start - prev_tune_ts) * 1000.0
             err_ms = interval_ms - SWEEP_DWELL_MS
