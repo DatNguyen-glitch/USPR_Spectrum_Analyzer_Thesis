@@ -2,10 +2,24 @@
 """
 RX-only controller using GNU Radio top_block (no GUI).
 
+Architecture:
+  - GR Scheduler Thread : runs FrameProcessor.work() — 3-state machine
+        COLLECTING  →  count frames, run detection
+        WAITING     →  discard all frames while retune in progress
+        SETTLING    →  discard settle_frames after retune, then → COLLECTING
+  - Retune Worker Thread : event-driven, calls set_center_freq() on request
+  - Main Thread          : waits for stop_event, then shuts down
+
+Synchronisation between FrameProcessor and Retune Worker uses a ping-pong
+handshake with two threading.Events:
+    retune_request  (FrameProcessor → Retune Worker)
+    retune_done     (Retune Worker  → FrameProcessor)
+
 Flow:
-- RX: uhd.usrp_source -> blocks.stream_to_vector(FFT_LEN) -> FrameProcessor
+  RX: uhd.usrp_source -> stream_to_vector(FFT_LEN) -> FrameProcessor
 """
 
+import enum
 import signal
 import threading
 import time
@@ -18,10 +32,14 @@ import numpy as np
 from gnuradio import blocks, gr, uhd
 
 
+# ─── Hardware ────────────────────────────────────────────────────────────────
 RX_SERIAL = "34D628E"
 FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/uhd/usrp_b210_fpga_fixed_freq_shift_v1.bin"
 
+# ─── RX parameters ───────────────────────────────────────────────────────────
 RX_SAMP_RATE = 50e6
+FPGA_DECIMATION = 50 
+HOST_SAMP_RATE = RX_SAMP_RATE / FPGA_DECIMATION
 RX_GAIN_DB = 22
 RX_START_HZ = 90e6
 RX_STOP_HZ = 1e9
@@ -32,31 +50,44 @@ RX_WARMUP_DELAY_S = 0.1
 RX_WARMUP_HOLD_S = 0.1
 RX_FINAL_HZ = 5e8
 FFT_LEN = 1024
+
+# ─── Sweep ───────────────────────────────────────────────────────────────────
 SWEEP_ENABLE = True
 SWEEP_DWELL_MS = 10
 MEASURE_SWEEP_TIMING = True
 SWEEP_TIMING_LOG_EVERY = 1
 
+# ─── Detection ───────────────────────────────────────────────────────────────
 DETECT_MARGIN_DB = 5.0
 MIN_SIGNAL_BINS = 2
 MIN_PEAK_SNR_DB = 10.5
 DC_GUARD_BINS = 24
 DC_GUARD_HZ = 1.5e6
+DETECT_EVERY = 50
 
-DETECT_EVERY = 5
+# ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_FILE = Path(__file__).with_name("sweep_gr.log")
 LOG_QUEUE_MAXSIZE = 10000
 LOG_BATCH_SIZE = 200
 LOG_FLUSH_INTERVAL_S = 0.5
-# Drop vectors for a short window after each retune to avoid queued old-center frames.
+
+# ─── Settle ──────────────────────────────────────────────────────────────────
 SETTLE_TIME_AFTER_TUNE_MS = 0.2
 
+# ─── Derived: frames per dwell (sample-clock accurate) ──────────────────────
+FRAMES_PER_DWELL = int(math.ceil((SWEEP_DWELL_MS / 1000.0) * HOST_SAMP_RATE / FFT_LEN))
+# FRAMES_PER_DWELL = 10
 
+# ─── Globals ─────────────────────────────────────────────────────────────────
 stop_event = threading.Event()
 log_queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
 log_drop_lock = threading.Lock()
 log_drop_count = 0
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _enqueue_log_line(line: str):
     global log_drop_count
@@ -116,15 +147,22 @@ def log(msg: str):
 
 
 def reset_log_file():
-    # Truncate on startup so each run has a fresh log.
     LOG_FILE.write_text("", encoding="utf-8")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def compute_settle_frames() -> int:
-    vectors_per_second = RX_SAMP_RATE / FFT_LEN
+    vectors_per_second = HOST_SAMP_RATE / FFT_LEN
     settle_frames = int(math.ceil((SETTLE_TIME_AFTER_TUNE_MS / 1000.0) * vectors_per_second))
     return max(0, settle_frames)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Signal detection
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_signals(
     fft_complex: np.ndarray, center_freq_hz: float
@@ -190,10 +228,27 @@ def detect_signals(
     return noise_floor, threshold, signals, global_argmax_bin, global_argmax_freq
 
 
-class FrameProcessor(gr.sync_block):
-    """Consume vectorized complex FFT frames and run the same detector as dual_usrp_sweep."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# FrameProcessor — 3-state machine
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, fft_len: int, center_hz: float, detect_every: int):
+class _State(enum.IntEnum):
+    COLLECTING = 0
+    WAITING = 1
+    SETTLING = 2
+
+
+class FrameProcessor(gr.sync_block):
+    """
+    Consume vectorised complex FFT frames.  Internally implements a 3-state
+    machine synchronised with the retune worker thread via two Events:
+
+        retune_request : set by work() when dwell is complete
+        retune_done    : set by retune worker when hardware is at new freq
+    """
+
+    def __init__(self, fft_len: int, center_hz: float, detect_every: int,
+                 frames_per_dwell: int):
         gr.sync_block.__init__(
             self,
             name="FrameProcessor",
@@ -201,20 +256,36 @@ class FrameProcessor(gr.sync_block):
             out_sig=None,
         )
         self.fft_len = int(fft_len)
-        self.center_hz = float(center_hz)
         self.detect_every = max(1, int(detect_every))
         self.frame_counter = 0
-        self.tune_id = 0
-        self.frame_epoch = 0
-        self.settle_frames = 0
-        self._lock = threading.Lock()
 
+        # ── Shared state (written by retune worker via begin_tune,
+        #    read by work under _lock) ────────────────────────────
+        self._lock = threading.Lock()
+        self.tune_id = 0
+        self.center_hz = float(center_hz)
+        self._settle_total = 0  # set by begin_tune
+
+        # ── State machine (only touched by the GR scheduler thread) ──
+        self._state = _State.WAITING     # start WAITING for first retune_done
+        self._settle_remaining = 0
+        self._frame_epoch = 0
+        self._frames_per_dwell = frames_per_dwell
+
+        # Snapped copies of shared state (read without lock during COLLECTING)
+        self._snap_tune_id = 0
+        self._snap_center_hz = float(center_hz)
+
+        # ── Ping-pong events ─────────────────────────────────────
+        self.retune_request = threading.Event()
+        self.retune_done = threading.Event()
+
+    # Called by retune worker thread
     def begin_tune(self, tune_id: int, freq_hz: float, settle_frames: int):
         with self._lock:
             self.tune_id = int(tune_id)
             self.center_hz = float(freq_hz)
-            self.frame_epoch = 0
-            self.settle_frames = max(0, int(settle_frames))
+            self._settle_total = max(0, int(settle_frames))
 
     def work(self, input_items, output_items):
         frames = input_items[0]
@@ -222,30 +293,54 @@ class FrameProcessor(gr.sync_block):
             vec = np.asarray(frames[i], dtype=np.complex64)
             self.frame_counter += 1
 
-            with self._lock:
-                tune_id = self.tune_id
-                center_hz = self.center_hz
-                if self.settle_frames > 0:
-                    self.settle_frames -= 1
-                    self.frame_epoch += 1
-                    continue
-                frame_epoch = self.frame_epoch
-                self.frame_epoch += 1
+            # ── WAITING: discard everything until retune completes ────
+            if self._state == _State.WAITING:
+                if self.retune_done.is_set():
+                    self.retune_done.clear()
+                    with self._lock:
+                        self._settle_remaining = self._settle_total
+                    self._state = _State.SETTLING
+                continue  # discard frame whether we transitioned or not
+
+            # ── SETTLING: discard frames while PLL / pipeline settles ─
+            if self._state == _State.SETTLING:
+                self._settle_remaining -= 1
+                if self._settle_remaining <= 0:
+                    # Snap shared state once — valid for entire COLLECTING run
+                    with self._lock:
+                        self._snap_tune_id = self.tune_id
+                        self._snap_center_hz = self.center_hz
+                    self._frame_epoch = 0
+                    self._state = _State.COLLECTING
+                continue  # discard this frame too
+
+            # ── COLLECTING: process frames, count toward dwell ────────
+            self._frame_epoch += 1
+
+            # Check dwell limit (0 = unlimited, used when sweep disabled)
+            if self._frames_per_dwell > 0 and self._frame_epoch >= self._frames_per_dwell:
+                self._state = _State.WAITING
+                self.retune_request.set()
+                continue  # don't process the boundary frame
 
             if self.frame_counter % self.detect_every != 0:
                 continue
 
-            noise_floor, threshold, signals, g_bin, g_freq = detect_signals(vec, center_hz)
+            noise_floor, threshold, signals, g_bin, g_freq = detect_signals(
+                vec, self._snap_center_hz
+            )
 
             if signals:
                 for sig in signals:
                     log(
-                        "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
-                        "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
-                        "g_argmax_bin={} | g_argmax_freq={:.3f} MHz".format(
-                            tune_id,
-                            frame_epoch,
-                            center_hz / 1e6,
+                        "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | "
+                        "peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
+                        "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | "
+                        "thr={:+.1f} dB | g_argmax_bin={} | g_argmax_freq={:.3f} MHz"
+                        .format(
+                            self._snap_tune_id,
+                            self._frame_epoch,
+                            self._snap_center_hz / 1e6,
                             sig["peak_bin"],
                             sig["peak_db"],
                             sig["peak_snr_db"],
@@ -260,6 +355,10 @@ class FrameProcessor(gr.sync_block):
 
         return len(frames)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GNU Radio top block
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class RxTopBlock(gr.top_block):
     def __init__(self):
@@ -293,13 +392,15 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_rx_agc(False, 0)
 
         self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex * 1, FFT_LEN)
-        self.frame_processor = FrameProcessor(FFT_LEN, self.center_hz, DETECT_EVERY)
+        self.frame_processor = FrameProcessor(
+            FFT_LEN, self.center_hz, DETECT_EVERY,
+            frames_per_dwell=FRAMES_PER_DWELL if SWEEP_ENABLE else 0,
+        )
 
         self.connect((self.usrp_source, 0), (self.stream_to_vector, 0))
         self.connect((self.stream_to_vector, 0), (self.frame_processor, 0))
 
         self.tune_id = 0
-        self.set_center_freq(self.center_hz)
 
     def set_center_freq(self, freq_hz: float):
         new_freq = float(freq_hz)
@@ -317,8 +418,14 @@ class RxTopBlock(gr.top_block):
         )
 
 
-def run_warmup_and_optional_sweep(tb: RxTopBlock):
-    # Match signal_detection warm-up sequence: 400 -> (0.5s) 900 -> (0.2s) 500
+# ═══════════════════════════════════════════════════════════════════════════════
+# Retune worker (was ctrl_thread) — event-driven
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def retune_worker(tb: RxTopBlock):
+    fp = tb.frame_processor
+
+    # ── Warmup sequence ──────────────────────────────────────────────────
     time.sleep(RX_WARMUP_DELAY_S)
     if stop_event.is_set():
         return
@@ -328,57 +435,64 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
     if stop_event.is_set():
         return
 
+    # Tune to the first sweep frequency and kick the FrameProcessor
+    # out of its initial WAITING state.
     tb.set_center_freq(RX_FINAL_HZ)
+    fp.retune_done.set()  # FrameProcessor transitions WAITING → SETTLING → COLLECTING
 
     if not SWEEP_ENABLE:
+        # No sweep — just let FrameProcessor collect forever at RX_FINAL_HZ.
+        stop_event.wait()
         return
 
-    dwell_s = SWEEP_DWELL_MS / 1000.0
+    # ── Sweep loop (event-driven) ────────────────────────────────────────
     center_hz = RX_FINAL_HZ
     loop_idx = 0
     prev_tune_ts = time.perf_counter()
+
     while not stop_event.is_set():
-        tune_start = time.perf_counter()                                                                                                                                                            
-        tb.set_center_freq(center_hz)                                                                                                                                                               
-        tune_end = time.perf_counter()
-                                                                                                                                                                                                    
-        remaining_s = dwell_s - (tune_end - tune_start)                                                                                                                                             
-        if remaining_s > 0:
-            time.sleep(remaining_s) 
+        # Block until FrameProcessor says "I'm done with this dwell"
+        while not fp.retune_request.wait(timeout=0.2):
+            if stop_event.is_set():
+                return
+        fp.retune_request.clear()
 
-        # sleep_start = time.perf_counter()
-        # time.sleep(dwell_s)
-        # sleep_end = time.perf_counter()
-
+        # Advance frequency
         center_hz += RX_STEP_HZ
         if center_hz > RX_STOP_HZ:
             center_hz = RX_START_HZ
 
-        # tune_start = time.perf_counter()
-        # tb.set_center_freq(center_hz)
-        # tune_end = time.perf_counter()
+        # Retune hardware (blocks 4–128 ms)
+        tune_start = time.perf_counter()
+        tb.set_center_freq(center_hz)
+        tune_end = time.perf_counter()
 
+        # Signal FrameProcessor: WAITING → SETTLING
+        fp.retune_done.set()
+
+        # Timing log
         loop_idx += 1
         if MEASURE_SWEEP_TIMING and (loop_idx % max(1, SWEEP_TIMING_LOG_EVERY) == 0):
-            # sleep_ms = (sleep_end - sleep_start) * 1000.0
-            sleep_ms = 0
             tune_ms = (tune_end - tune_start) * 1000.0
             interval_ms = (tune_start - prev_tune_ts) * 1000.0
-            err_ms = interval_ms - SWEEP_DWELL_MS
             log(
-                "[TIMING] loop={} | target={:.3f} ms | sleep={:.3f} ms | tune_call={:.3f} ms | "
-                "interval_between_tunes={:.3f} ms | err={:+.3f} ms".format(
+                "[TIMING] loop={} | target_dwell={:.1f} ms | tune_call={:.3f} ms | "
+                "interval_between_tunes={:.3f} ms | frames_per_dwell={}"
+                .format(
                     loop_idx,
                     SWEEP_DWELL_MS,
-                    sleep_ms,
                     tune_ms,
                     interval_ms,
-                    err_ms,
+                    FRAMES_PER_DWELL,
                 )
             )
 
         prev_tune_ts = tune_start
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     reset_log_file()
@@ -391,18 +505,23 @@ def main():
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
+    log(
+        f"[INIT] samp_rate={RX_SAMP_RATE/1e6:.0f} Msps | fft={FFT_LEN} | "
+        f"dwell={SWEEP_DWELL_MS} ms | frames_per_dwell={FRAMES_PER_DWELL} | "
+        f"sweep={RX_START_HZ/1e6:.0f}–{RX_STOP_HZ/1e6:.0f} MHz step={RX_STEP_HZ/1e6:.0f} MHz"
+    )
+
     log_thread.start()
     tb.start()
 
-    ctrl_thread = threading.Thread(target=run_warmup_and_optional_sweep, args=(tb,), daemon=True)
+    ctrl_thread = threading.Thread(target=retune_worker, args=(tb,), daemon=True)
     ctrl_thread.start()
 
-    while not stop_event.is_set():
-        time.sleep(0.2)
+    stop_event.wait()
 
     tb.stop()
     tb.wait()
-    ctrl_thread.join(timeout=1.0)
+    ctrl_thread.join(timeout=2.0)
     log_thread.join(timeout=2.0)
 
 
