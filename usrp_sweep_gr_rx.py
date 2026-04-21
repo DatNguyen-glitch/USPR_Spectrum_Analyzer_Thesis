@@ -121,9 +121,11 @@ def reset_log_file():
 
 
 def compute_settle_frames() -> int:
-    vectors_per_second = (RX_SAMP_RATE/2) / FFT_LEN
-    settle_frames = int(math.ceil((SETTLE_TIME_AFTER_TUNE_MS / 1000.0) * vectors_per_second))
-    return max(1, settle_frames)
+    # GR ring buffers (usrp_source → stream_to_vector → FrameProcessor)
+    # hold ~10-15 stale vectors after a retune.  We must discard all of
+    # them before running detection, otherwise we process data from the
+    # previous center frequency.  20 frames gives comfortable margin.
+    return 20
 
 
 def detect_signals(
@@ -206,15 +208,23 @@ class FrameProcessor(gr.sync_block):
         self.frame_counter = 0
         self.tune_id = 0
         self.frame_epoch = 0
-        self.settle_frames = 0
+        self._discard_all = False   # when True, discard every frame
+        self._settled = threading.Event()  # signals retune_worker that settle is done
         self._lock = threading.Lock()
 
-    def begin_tune(self, tune_id: int, freq_hz: float, settle_frames: int):
+    def begin_tune(self, tune_id: int, freq_hz: float):
         with self._lock:
             self.tune_id = int(tune_id)
             self.center_hz = float(freq_hz)
             self.frame_epoch = 0
-            self.settle_frames = max(0, int(settle_frames))
+            self._discard_all = True
+            self._settled.clear()
+
+    def mark_settled(self):
+        """Called by retune_worker after dwell sleep to start collecting."""
+        with self._lock:
+            self._discard_all = False
+        self._settled.set()
 
     def work(self, input_items, output_items):
         frames = input_items[0]
@@ -225,9 +235,7 @@ class FrameProcessor(gr.sync_block):
             with self._lock:
                 tune_id = self.tune_id
                 center_hz = self.center_hz
-                if self.settle_frames > 0:
-                    self.settle_frames -= 1
-                    self.frame_epoch += 1
+                if self._discard_all:
                     continue
                 frame_epoch = self.frame_epoch
                 self.frame_epoch += 1
@@ -308,12 +316,12 @@ class RxTopBlock(gr.top_block):
 
         self.center_hz = new_freq
         self.tune_id += 1
-        settle_frames = compute_settle_frames()
+        # Tell FrameProcessor to discard ALL frames from now on
+        self.frame_processor.begin_tune(self.tune_id, self.center_hz)
+        # Hardware tune (3-107 ms) — FrameProcessor discards during this
         self.usrp_source.set_center_freq(self.center_hz, 0)
-        self.frame_processor.begin_tune(self.tune_id, self.center_hz, settle_frames)
         log(
-            f"[RX] tune_id={self.tune_id} -> {self.center_hz/1e6:.1f} MHz "
-            f"(settle_frames={settle_frames}, settle_ms={SETTLE_TIME_AFTER_TUNE_MS:.1f})"
+            f"[RX] tune_id={self.tune_id} -> {self.center_hz/1e6:.1f} MHz"
         )
 
 
@@ -329,6 +337,8 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
         return
 
     tb.set_center_freq(RX_FINAL_HZ)
+    # For non-sweep mode, enable collection immediately
+    tb.frame_processor.mark_settled()
 
     if not SWEEP_ENABLE:
         return
@@ -342,7 +352,12 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
         tb.set_center_freq(center_hz)
         tune_end = time.perf_counter()
 
-        # Sleep full dwell AFTER tune so FrameProcessor gets valid data
+        # Phase 1: flush — FrameProcessor discards all frames while
+        # stale GR buffer data drains out (tune_call + dwell_s)
+        time.sleep(dwell_s/20)
+
+        # Phase 2: collect — enable detection on clean data
+        tb.frame_processor.mark_settled()
         time.sleep(dwell_s)
         sleep_end = time.perf_counter()
 
