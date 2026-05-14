@@ -19,7 +19,8 @@ from gnuradio import blocks, gr, uhd
 
 
 RX_SERIAL = "34D628E"
-FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/uhd/usrp_b210_fpga_fixed_freq_shift_v1.bin"
+# FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/uhd/usrp_b210_fpga_fixed_freq_shift_v1.bin"
+FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/FPGA_bin_files/usrp_b210_1rx_fft_2k.bin"
 
 RX_SAMP_RATE = 50e6
 RX_GAIN_DB = 22
@@ -28,23 +29,29 @@ RX_STOP_HZ = 1e9
 RX_STEP_HZ = 40e6
 RX_INIT_HZ = 4e8
 RX_WARMUP_HZ = 5e8
-RX_WARMUP_DELAY_S = 0.1
-RX_WARMUP_HOLD_S = 0.1
+RX_WARMUP_DELAY_S = 1
+RX_WARMUP_HOLD_S = 1
 RX_FINAL_HZ = 5e8
-FFT_LEN = 1024
+FFT_LEN = 2048
 SWEEP_ENABLE = True
 SWEEP_DWELL_MS = 10
 MEASURE_SWEEP_TIMING = True
 SWEEP_TIMING_LOG_EVERY = 1
 
-DETECT_MARGIN_DB = 5.0
-MIN_SIGNAL_BINS = 2
-MIN_PEAK_SNR_DB = 10.5
-DC_GUARD_BINS = 24
+DETECT_MARGIN_DB = 4.0
+# MIN_SIGNAL_BINS = 2
+MIN_SIGNAL_BINS = 4
+MIN_PEAK_SNR_DB = 10
+# EDGE_GUARD_BINS = 20
+# DC_GUARD_BINS = 24
+EDGE_GUARD_BINS = 40
+DC_GUARD_BINS = 48
 DC_GUARD_HZ = 1.5e6
 
 DETECT_EVERY = 5
 LOG_FILE = Path(__file__).with_name("sweep_gr.log")
+DEBUG_FRAME_DIR = Path(__file__).with_name("debug_frames")
+DEBUG_FRAME_INDEX = 5
 LOG_QUEUE_MAXSIZE = 10000
 LOG_BATCH_SIZE = 200
 LOG_FLUSH_INTERVAL_S = 0.5
@@ -120,6 +127,27 @@ def reset_log_file():
     LOG_FILE.write_text("", encoding="utf-8")
 
 
+def save_debug_frame(
+    frame_vec: np.ndarray, tune_id: int, center_hz: float, frame_epoch: int
+):
+    DEBUG_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    center_mhz = center_hz / 1e6
+    file_name = (
+        f"tune_{tune_id:04d}_center_{center_mhz:.1f}MHz_frame_{frame_epoch + 1:02d}.npz"
+    )
+    file_path = DEBUG_FRAME_DIR / file_name
+    np.savez(
+        file_path,
+        frame=frame_vec.astype(np.complex64, copy=False),
+        tune_id=np.int32(tune_id),
+        center_hz=np.float64(center_hz),
+        frame_epoch=np.int32(frame_epoch),
+        sample_rate=np.float64(RX_SAMP_RATE),
+        fft_len=np.int32(frame_vec.size),
+    )
+    log(f"[DEBUG] saved_frame={file_path.name}")
+
+
 def compute_settle_frames() -> int:
     # GR ring buffers (usrp_source → stream_to_vector → FrameProcessor)
     # hold ~10-15 stale vectors after a retune.  We must discard all of
@@ -143,6 +171,9 @@ def detect_signals(
     global_argmax_freq = float(freq_axis[global_argmax_bin])
 
     mask = power_db > threshold
+    if EDGE_GUARD_BINS > 0:
+        mask[:EDGE_GUARD_BINS] = False
+        mask[-EDGE_GUARD_BINS:] = False
     mid = fft_complex.size // 2
     lo = max(0, mid - DC_GUARD_BINS)
     hi = min(mask.size, mid + DC_GUARD_BINS + 1)
@@ -211,9 +242,13 @@ class FrameProcessor(gr.sync_block):
         self._discard_all = False   # when True, discard every frame
         self._settled = threading.Event()  # signals retune_worker that settle is done
         self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._detect_busy = False
 
     def begin_tune(self, tune_id: int, freq_hz: float):
-        with self._lock:
+        with self._cv:
+            while self._detect_busy:
+                self._cv.wait(timeout=0.01)
             self.tune_id = int(tune_id)
             self.center_hz = float(freq_hz)
             self.frame_epoch = 0
@@ -231,6 +266,7 @@ class FrameProcessor(gr.sync_block):
         for i in range(len(frames)):
             vec = np.asarray(frames[i], dtype=np.complex64)
             self.frame_counter += 1
+            should_detect = False
 
             with self._lock:
                 tune_id = self.tune_id
@@ -240,31 +276,45 @@ class FrameProcessor(gr.sync_block):
                 frame_epoch = self.frame_epoch
                 self.frame_epoch += 1
 
-            if frame_epoch % self.detect_every != 0:
+                if frame_epoch + 1 == DEBUG_FRAME_INDEX:
+                    save_debug_frame(vec, tune_id, center_hz, frame_epoch)
+
+                if frame_epoch % self.detect_every == 0:
+                    self._detect_busy = True
+                    should_detect = True
+
+            if not should_detect:
                 continue
 
-            noise_floor, threshold, signals, g_bin, g_freq = detect_signals(vec, center_hz)
+            try:
+                noise_floor, threshold, signals, g_bin, g_freq = detect_signals(vec, center_hz)
 
-            if signals:
-                for sig in signals:
-                    log(
-                        "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
-                        "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
-                        "g_argmax_bin={} | g_argmax_freq={:.3f} MHz".format(
-                            tune_id,
-                            frame_epoch,
-                            center_hz / 1e6,
-                            sig["peak_bin"],
-                            sig["peak_db"],
-                            sig["peak_snr_db"],
-                            sig["peak_freq"] / 1e6,
-                            sig["width_hz"] / 1e3,
-                            noise_floor,
-                            threshold,
-                            g_bin,
-                            g_freq / 1e6,
-                        )
-                    )
+                with self._cv:
+                    # Handshake invariant: retune waits until this detect section exits.
+                    if not self._discard_all and self.tune_id == tune_id and signals:
+                        for sig in signals:
+                            log(
+                                "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
+                                "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
+                                "g_argmax_bin={} | g_argmax_freq={:.3f} MHz".format(
+                                    tune_id,
+                                    frame_epoch,
+                                    center_hz / 1e6,
+                                    sig["peak_bin"],
+                                    sig["peak_db"],
+                                    sig["peak_snr_db"],
+                                    sig["peak_freq"] / 1e6,
+                                    sig["width_hz"] / 1e3,
+                                    noise_floor,
+                                    threshold,
+                                    g_bin,
+                                    g_freq / 1e6,
+                                )
+                            )
+            finally:
+                with self._cv:
+                    self._detect_busy = False
+                    self._cv.notify_all()
 
         return len(frames)
 
