@@ -4,18 +4,34 @@ RX-only controller using GNU Radio top_block (no GUI).
 
 Flow:
 - RX: uhd.usrp_source -> blocks.stream_to_vector(FFT_LEN) -> FrameProcessor
+
+Streaming:
+- FrameProcessor writes detected signals + quantized FFT into two shared-memory
+  SPSC ring buffers.
+- Two separate processes (signal_publisher, fft_publisher) read from the ring
+  buffers and publish via ZMQ PUB sockets.
+- Main process (GNU Radio + detection) pinned to cores 0-1.
+- Signal publisher pinned to core 3, FFT publisher pinned to core 2.
 """
 
-import signal
+import atexit
+import json
+import multiprocessing
+import os
+import signal as signal_mod
+import struct
 import threading
 import time
 import math
 import queue
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 from gnuradio import blocks, gr, uhd
+
+from shm_ring_buffer import ShmRingBuffer
 
 
 RX_SERIAL = "34D628E"
@@ -49,14 +65,40 @@ DC_GUARD_BINS = 48
 DC_GUARD_HZ = 1.5e6
 
 DETECT_EVERY = 5
-LOG_FILE = Path(__file__).with_name("sweep_gr.log")
-DEBUG_FRAME_DIR = Path(__file__).with_name("debug_frames")
+LOG_FILE = Path(__file__).resolve().with_name("sweep_gr.log")
+DEBUG_FRAME_DIR = Path(__file__).resolve().with_name("debug_frames")
 DEBUG_FRAME_INDEX = 5
 LOG_QUEUE_MAXSIZE = 10000
 LOG_BATCH_SIZE = 200
 LOG_FLUSH_INTERVAL_S = 0.5
 # Drop vectors for a short window after each retune to avoid queued old-center frames.
 SETTLE_TIME_AFTER_TUNE_MS = 0.2
+
+# ── ZMQ streaming configuration ──────────────────────────────────────────────
+ZMQ_SIGNAL_PORT = 5555
+ZMQ_FFT_PORT = 5556
+ZMQ_SIGNAL_HWM = 500
+ZMQ_FFT_HWM = 200
+
+# Shared-memory ring buffer sizing
+SHM_SIG_NAME = "spec_sig_ring"
+SHM_FFT_NAME = "spec_fft_ring"
+SHM_SIG_SLOTS = 512
+SHM_SIG_SLOT_SIZE = 16384      # max JSON payload bytes per signal event
+SHM_FFT_SLOTS = 256
+SHM_FFT_SLOT_SIZE = 2048 + 512  # 2048 uint8 bins + up to 512 bytes JSON metadata
+
+# FFT quantization
+FFT_QUANTIZE_DB_MIN = -120.0
+FFT_QUANTIZE_DB_MAX = 0.0
+
+# Send every Nth FFT frame to ZMQ (bandwidth reduction)
+FFT_STREAM_DECIMATION = 5
+
+# CPU core pinning (Pi 5 has cores 0-3)
+CORES_MAIN = {0, 1}   # GNU Radio + detection
+CORE_FFT_PUB = {2}    # FFT ZMQ publisher
+CORE_SIG_PUB = {3}    # Signal ZMQ publisher
 
 
 stop_event = threading.Event()
@@ -223,10 +265,82 @@ def detect_signals(
     return noise_floor, threshold, signals, global_argmax_bin, global_argmax_freq
 
 
+def quantize_fft_to_uint8(fft_complex: np.ndarray) -> np.ndarray:
+    """Convert complex FFT vector to fftshift'd magnitude in dB, quantized to uint8."""
+    mag_sq = np.abs(np.fft.fftshift(fft_complex)) ** 2
+    power_db = 10.0 * np.log10(mag_sq + 1e-12)
+    clipped = np.clip(power_db, FFT_QUANTIZE_DB_MIN, FFT_QUANTIZE_DB_MAX)
+    scaled = (clipped - FFT_QUANTIZE_DB_MIN) / (FFT_QUANTIZE_DB_MAX - FFT_QUANTIZE_DB_MIN) * 255.0
+    return scaled.astype(np.uint8)
+
+
+# ── ZMQ publisher processes ──────────────────────────────────────────────────
+
+def _signal_publisher_process(shm_name, slot_count, slot_size, port, hwm):
+    """Publish detected-signal JSON over ZMQ PUB (one process, one core)."""
+    import zmq
+
+    try:
+        os.sched_setaffinity(0, CORE_SIG_PUB)
+    except OSError:
+        pass  # non-Linux or insufficient permissions
+
+    ring = ShmRingBuffer(shm_name, slot_count, slot_size, create=False)
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.PUB)
+    sock.setsockopt(zmq.SNDHWM, hwm)
+    sock.bind(f"tcp://*:{port}")
+
+    while True:
+        data = ring.read()
+        if data is None:
+            time.sleep(0.0005)
+            continue
+        try:
+            sock.send(data, zmq.NOBLOCK)
+        except zmq.Again:
+            pass  # subscriber too slow — drop
+
+
+def _fft_publisher_process(shm_name, slot_count, slot_size, port, hwm):
+    """Publish quantized FFT as ZMQ multipart [metadata_json, uint8_binary]."""
+    import zmq
+
+    try:
+        os.sched_setaffinity(0, CORE_FFT_PUB)
+    except OSError:
+        pass
+
+    ring = ShmRingBuffer(shm_name, slot_count, slot_size, create=False)
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.PUB)
+    sock.setsockopt(zmq.SNDHWM, hwm)
+    sock.bind(f"tcp://*:{port}")
+
+    while True:
+        data = ring.read()
+        if data is None:
+            time.sleep(0.0005)
+            continue
+        # Slot format: [2-byte meta_len][meta_json_bytes][fft_uint8_bytes]
+        if len(data) < 2:
+            continue
+        meta_len = struct.unpack_from("<H", data, 0)[0]
+        if len(data) < 2 + meta_len:
+            continue
+        meta_bytes = data[2: 2 + meta_len]
+        fft_bytes = data[2 + meta_len:]
+        try:
+            sock.send_multipart([meta_bytes, fft_bytes], zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+
+
 class FrameProcessor(gr.sync_block):
     """Consume vectorized complex FFT frames and run the same detector as dual_usrp_sweep."""
 
-    def __init__(self, fft_len: int, center_hz: float, detect_every: int):
+    def __init__(self, fft_len: int, center_hz: float, detect_every: int,
+                 sig_ring: ShmRingBuffer = None, fft_ring: ShmRingBuffer = None):
         gr.sync_block.__init__(
             self,
             name="FrameProcessor",
@@ -244,6 +358,8 @@ class FrameProcessor(gr.sync_block):
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._detect_busy = False
+        self._sig_ring = sig_ring
+        self._fft_ring = fft_ring
 
     def begin_tune(self, tune_id: int, freq_hz: float):
         with self._cv:
@@ -283,6 +399,23 @@ class FrameProcessor(gr.sync_block):
                     self._detect_busy = True
                     should_detect = True
 
+            # ── Stream quantized FFT to ring buffer ──────────────────
+            if self._fft_ring is not None and frame_epoch % FFT_STREAM_DECIMATION == 0:
+                fft_uint8 = quantize_fft_to_uint8(vec)
+                meta = json.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "tune_id": tune_id,
+                    "center_hz": center_hz,
+                    "sr": RX_SAMP_RATE,
+                    "fft_len": self.fft_len,
+                    "db_min": FFT_QUANTIZE_DB_MIN,
+                    "db_max": FFT_QUANTIZE_DB_MAX,
+                    "epoch": frame_epoch,
+                }, separators=(",", ":")).encode("utf-8")
+                # Pack: [2-byte meta_len][meta][fft_uint8]
+                slot_data = struct.pack("<H", len(meta)) + meta + fft_uint8.tobytes()
+                self._fft_ring.write(slot_data)
+
             if not should_detect:
                 continue
 
@@ -292,6 +425,18 @@ class FrameProcessor(gr.sync_block):
                 with self._cv:
                     # Handshake invariant: retune waits until this detect section exits.
                     if not self._discard_all and self.tune_id == tune_id and signals:
+                        # ── Stream detected signals to ring buffer ────
+                        if self._sig_ring is not None:
+                            sig_payload = json.dumps({
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "tune_id": tune_id,
+                                "center_hz": center_hz,
+                                "noise_floor_db": noise_floor,
+                                "threshold_db": threshold,
+                                "signals": signals,
+                            }, separators=(",", ":")).encode("utf-8")
+                            self._sig_ring.write(sig_payload)
+
                         for sig in signals:
                             log(
                                 "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
@@ -320,7 +465,7 @@ class FrameProcessor(gr.sync_block):
 
 
 class RxTopBlock(gr.top_block):
-    def __init__(self):
+    def __init__(self, sig_ring=None, fft_ring=None):
         gr.top_block.__init__(self, "dual_usrp_sweep_gr_rx", catch_exceptions=True)
 
         self.center_hz = RX_INIT_HZ
@@ -351,7 +496,10 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_rx_agc(False, 0)
 
         self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex * 1, FFT_LEN)
-        self.frame_processor = FrameProcessor(FFT_LEN, self.center_hz, DETECT_EVERY)
+        self.frame_processor = FrameProcessor(
+            FFT_LEN, self.center_hz, DETECT_EVERY,
+            sig_ring=sig_ring, fft_ring=fft_ring,
+        )
 
         self.connect((self.usrp_source, 0), (self.stream_to_vector, 0))
         self.connect((self.stream_to_vector, 0), (self.frame_processor, 0))
@@ -434,16 +582,59 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
         prev_tune_ts = tune_start
 
 
+def _cleanup_shm(*names):
+    """Best-effort removal of shared memory segments."""
+    from multiprocessing.shared_memory import SharedMemory
+    for name in names:
+        try:
+            shm = SharedMemory(name=name, create=False)
+            shm.close()
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def main():
+    # ── Pin main process to cores 0-1 ────────────────────────────────────
+    try:
+        os.sched_setaffinity(0, CORES_MAIN)
+    except OSError:
+        pass
+
     reset_log_file()
-    tb = RxTopBlock()
+
+    # ── Create shared-memory ring buffers ─────────────────────────────────
+    sig_ring = ShmRingBuffer(SHM_SIG_NAME, SHM_SIG_SLOTS, SHM_SIG_SLOT_SIZE, create=True)
+    fft_ring = ShmRingBuffer(SHM_FFT_NAME, SHM_FFT_SLOTS, SHM_FFT_SLOT_SIZE, create=True)
+    atexit.register(_cleanup_shm, SHM_SIG_NAME, SHM_FFT_NAME)
+
+    # ── Spawn ZMQ publisher processes ─────────────────────────────────────
+    sig_pub = multiprocessing.Process(
+        target=_signal_publisher_process,
+        args=(SHM_SIG_NAME, SHM_SIG_SLOTS, SHM_SIG_SLOT_SIZE, ZMQ_SIGNAL_PORT, ZMQ_SIGNAL_HWM),
+        daemon=True,
+        name="sig_publisher",
+    )
+    fft_pub = multiprocessing.Process(
+        target=_fft_publisher_process,
+        args=(SHM_FFT_NAME, SHM_FFT_SLOTS, SHM_FFT_SLOT_SIZE, ZMQ_FFT_PORT, ZMQ_FFT_HWM),
+        daemon=True,
+        name="fft_publisher",
+    )
+    sig_pub.start()
+    fft_pub.start()
+    log(f"[ZMQ] signal_publisher pid={sig_pub.pid} core={CORE_SIG_PUB}")
+    log(f"[ZMQ] fft_publisher pid={fft_pub.pid} core={CORE_FFT_PUB}")
+
+    # ── GNU Radio top block (runs in main process) ────────────────────────
+    tb = RxTopBlock(sig_ring=sig_ring, fft_ring=fft_ring)
     log_thread = threading.Thread(target=_log_writer_worker, daemon=True)
 
     def _sig_handler(sig, frame):
         stop_event.set()
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+    signal_mod.signal(signal_mod.SIGINT, _sig_handler)
+    signal_mod.signal(signal_mod.SIGTERM, _sig_handler)
 
     log_thread.start()
     tb.start()
@@ -454,10 +645,22 @@ def main():
     while not stop_event.is_set():
         time.sleep(0.2)
 
+    # ── Shutdown ──────────────────────────────────────────────────────────
     tb.stop()
     tb.wait()
     ctrl_thread.join(timeout=1.0)
+
+    # Terminate publisher processes
+    for p in (sig_pub, fft_pub):
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=2.0)
+
     log_thread.join(timeout=2.0)
+
+    # Release shared memory
+    sig_ring.unlink()
+    fft_ring.unlink()
 
 
 if __name__ == "__main__":
