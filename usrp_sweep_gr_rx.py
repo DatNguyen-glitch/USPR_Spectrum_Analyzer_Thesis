@@ -32,11 +32,13 @@ import numpy as np
 from gnuradio import blocks, gr, uhd
 
 from shm_ring_buffer import ShmRingBuffer
+import psutil
+import zmq
 
 
 RX_SERIAL = "34D628E"
 # FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/uhd/usrp_b210_fpga_fixed_freq_shift_v1.bin"
-FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/FPGA_bin_files/usrp_b210_1rx_fft_2k.bin"
+FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/FPGA_bin_files/usrp_b210_1rx_fft_2k_1905.bin"
 
 RX_SAMP_RATE = 50e6
 RX_GAIN_DB = 22
@@ -79,6 +81,7 @@ ZMQ_SIGNAL_PORT = 5555
 ZMQ_FFT_PORT = 5556
 ZMQ_SIGNAL_HWM = 500
 ZMQ_FFT_HWM = 200
+ZMQ_TELEM_PORT = 5557
 
 # Shared-memory ring buffer sizing
 SHM_SIG_NAME = "spec_sig_ring"
@@ -336,6 +339,84 @@ def _fft_publisher_process(shm_name, slot_count, slot_size, port, hwm):
             pass
 
 
+def _telemetry_publisher_thread(tb: 'RxTopBlock', port: int = ZMQ_TELEM_PORT, interval_s: float = 1.0):
+    """Publish system + app telemetry as JSON over ZMQ PUB.
+
+    Runs in main process (reads `tb` attributes for USRP state).
+    """
+    try:
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.PUB)
+        sock.setsockopt(zmq.SNDHWM, 100)
+        sock.bind(f"tcp://*:{port}")
+    except Exception:
+        return
+
+    def read_temp_c():
+        # Try psutil sensors first
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                for k in temps:
+                    if temps[k]:
+                        return float(temps[k][0].current)
+        except Exception:
+            pass
+        # Fallback to sysfs
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                v = int(f.read().strip())
+                return float(v) / 1000.0
+        except Exception:
+            return None
+
+    start_time = time.time()
+    while not stop_event.is_set():
+        ts = datetime.now(timezone.utc).isoformat()
+        cpu_pct = None
+        try:
+            cpu_pct = psutil.cpu_percent(interval=None)
+        except Exception:
+            cpu_pct = None
+        try:
+            vm = psutil.virtual_memory()
+            ram_pct = float(vm.percent)
+            ram_used_mb = float(vm.used) / (1024 * 1024)
+        except Exception:
+            ram_pct = None
+            ram_used_mb = None
+
+        temp_c = read_temp_c()
+        uptime_s = time.time() - start_time
+
+        # Application-level state from top block
+        app_state = {}
+        try:
+            app_state["center_hz"] = float(tb.center_hz)
+            app_state["tune_id"] = int(tb.tune_id)
+            app_state["gain_db"] = float(getattr(tb, "current_gain", RX_GAIN_DB))
+        except Exception:
+            pass
+
+        payload = {
+            "ts": ts,
+            "temp_c": temp_c,
+            "cpu_percent": cpu_pct,
+            "ram_percent": ram_pct,
+            "ram_used_mb": ram_used_mb,
+            "uptime_s": uptime_s,
+            "app": app_state,
+        }
+
+        try:
+            sock.send_json(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # subscriber too slow; drop
+            pass
+
+        time.sleep(interval_s)
+
+
 class FrameProcessor(gr.sync_block):
     """Consume vectorized complex FFT frames and run the same detector as dual_usrp_sweep."""
 
@@ -491,6 +572,7 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_center_freq(self.center_hz, 0)
         self.usrp_source.set_antenna("RX2", 0)
         self.usrp_source.set_gain(RX_GAIN_DB, 0)
+        self.current_gain = float(RX_GAIN_DB)
         self.usrp_source.set_auto_dc_offset(True, 0)
         self.usrp_source.set_auto_iq_balance(True, 0)
         self.usrp_source.set_rx_agc(False, 0)
@@ -521,6 +603,14 @@ class RxTopBlock(gr.top_block):
         log(
             f"[RX] tune_id={self.tune_id} -> {self.center_hz/1e6:.1f} MHz"
         )
+
+    def set_gain(self, gain_db: float):
+        try:
+            self.usrp_source.set_gain(float(gain_db), 0)
+            self.current_gain = float(gain_db)
+            log(f"[RX] set_gain={self.current_gain} dB")
+        except Exception as e:
+            log(f"[RX] set_gain_failed: {e}")
 
 
 def run_warmup_and_optional_sweep(tb: RxTopBlock):
@@ -629,6 +719,7 @@ def main():
     # ── GNU Radio top block (runs in main process) ────────────────────────
     tb = RxTopBlock(sig_ring=sig_ring, fft_ring=fft_ring)
     log_thread = threading.Thread(target=_log_writer_worker, daemon=True)
+    telem_thread = threading.Thread(target=_telemetry_publisher_thread, args=(tb, ZMQ_TELEM_PORT), daemon=True)
 
     def _sig_handler(sig, frame):
         stop_event.set()
@@ -637,6 +728,7 @@ def main():
     signal_mod.signal(signal_mod.SIGTERM, _sig_handler)
 
     log_thread.start()
+    telem_thread.start()
     tb.start()
 
     ctrl_thread = threading.Thread(target=run_warmup_and_optional_sweep, args=(tb,), daemon=True)
@@ -655,6 +747,9 @@ def main():
         if p.is_alive():
             p.terminate()
             p.join(timeout=2.0)
+
+    # Wait for telemetry thread to stop
+    telem_thread.join(timeout=2.0)
 
     log_thread.join(timeout=2.0)
 
