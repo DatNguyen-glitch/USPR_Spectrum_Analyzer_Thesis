@@ -6,12 +6,13 @@ Architecture:
   - Main thread: ZMQ recv → enqueue to 2 bounded deques (never blocks on disk)
   - FFT writer thread: drains fft_queue → HDF5 direct chunk write (N=32 packing)
   - Signal writer thread: drains sig_queue → HDF5 vlen string batched write
+    - Telemetry writer thread: drains telem_queue → HDF5 batched telemetry records
 
 File rotation every 10 minutes.
 
 Usage:
-    python3 zmq_receiver.py 192.168.1.100
-    python3 zmq_receiver.py 192.168.1.100 --output-dir ./data
+    python3 zmq_receiver.py 100.69.245.69
+    python3 zmq_receiver.py 100.69.245.69 --output-dir ./data
 """
 
 import argparse
@@ -35,18 +36,22 @@ FFT_CHUNK_N = 32              # pack 32 frames into one HDF5 chunk
 FILE_ROTATION_SEC = 600       # rotate files every 10 minutes
 FFT_QUEUE_MAXLEN = 5000       # ~10s buffer at 488 fps
 SIG_QUEUE_MAXLEN = 5000
+TELEM_QUEUE_MAXLEN = 1000
 SIG_BATCH_INTERVAL_S = 0.1    # flush signal batch every 100ms
 FFT_FLUSH_EVERY = 1000        # flush HDF5 every 1000 rows
+TELEM_BATCH_INTERVAL_S = 0.5
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 stop_event = threading.Event()
 fft_queue = deque(maxlen=FFT_QUEUE_MAXLEN)
 sig_queue = deque(maxlen=SIG_QUEUE_MAXLEN)
+telem_queue = deque(maxlen=TELEM_QUEUE_MAXLEN)
 
 # Drop counters
 fft_drops = 0
 sig_drops = 0
+telem_drops = 0
 
 
 def dequantize_fft(fft_uint8: np.ndarray, db_min: float, db_max: float) -> np.ndarray:
@@ -114,6 +119,65 @@ def create_sig_file(output_dir: Path) -> tuple:
     f.attrs["created"] = datetime.now(timezone.utc).isoformat()
 
     return f, {"events": ds_events, "ts": ds_ts, "center": ds_center}, filepath
+
+
+def create_telem_file(output_dir: Path) -> tuple:
+    """Create a new HDF5 file for telemetry data. Returns (file, datasets dict, filepath)."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = output_dir / f"telemetry_{ts}.h5"
+
+    f = h5py.File(filepath, "w")
+
+    vlen_str = h5py.string_dtype()
+    ds_raw = f.create_dataset(
+        "events", shape=(0,), maxshape=(None,), chunks=(64,), dtype=vlen_str
+    )
+    ds_ts = f.create_dataset(
+        "timestamps", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_temp = f.create_dataset(
+        "temp_c", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_cpu = f.create_dataset(
+        "cpu_percent", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_ram_pct = f.create_dataset(
+        "ram_percent", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_ram_used = f.create_dataset(
+        "ram_used_mb", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_uptime = f.create_dataset(
+        "uptime_s", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_center = f.create_dataset(
+        "center_hz", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+    ds_tune_id = f.create_dataset(
+        "tune_id", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.uint32
+    )
+    ds_gain = f.create_dataset(
+        "gain_db", shape=(0,), maxshape=(None,), chunks=(64,), dtype=np.float64
+    )
+
+    f.attrs["created"] = datetime.now(timezone.utc).isoformat()
+
+    return (
+        f,
+        {
+            "raw": ds_raw,
+            "ts": ds_ts,
+            "temp": ds_temp,
+            "cpu": ds_cpu,
+            "ram_pct": ds_ram_pct,
+            "ram_used": ds_ram_used,
+            "uptime": ds_uptime,
+            "center": ds_center,
+            "tune_id": ds_tune_id,
+            "gain": ds_gain,
+        },
+        filepath,
+    )
 
 
 # ── FFT writer thread ─────────────────────────────────────────────────────────
@@ -298,6 +362,128 @@ def sig_writer_thread(output_dir: Path):
     print(f"[SIG-WRITER] Final close {filepath.name} ({row} events)")
 
 
+# ── Telemetry writer thread ───────────────────────────────────────────────────
+
+def telem_writer_thread(output_dir: Path):
+    """Drain telem_queue, write telemetry JSON + parsed fields to HDF5."""
+    f, ds, filepath = create_telem_file(output_dir)
+    print(f"[TELEM-WRITER] Opened {filepath.name}")
+
+    row = 0
+    file_start = time.monotonic()
+    last_flush = time.monotonic()
+
+    batch_raw = []
+    batch_ts = []
+    batch_temp = []
+    batch_cpu = []
+    batch_ram_pct = []
+    batch_ram_used = []
+    batch_uptime = []
+    batch_center = []
+    batch_tune_id = []
+    batch_gain = []
+
+    def _to_float(v):
+        try:
+            if v is None:
+                return np.nan
+            return float(v)
+        except Exception:
+            return np.nan
+
+    def _to_uint32(v):
+        try:
+            if v is None:
+                return np.uint32(0)
+            return np.uint32(int(v))
+        except Exception:
+            return np.uint32(0)
+
+    while not stop_event.is_set():
+        drained = 0
+        while drained < 100:
+            try:
+                item = telem_queue.popleft()
+            except IndexError:
+                break
+
+            batch_raw.append(item["raw_json"])
+            batch_ts.append(item.get("ts_epoch", time.time()))
+            batch_temp.append(_to_float(item.get("temp_c")))
+            batch_cpu.append(_to_float(item.get("cpu_percent")))
+            batch_ram_pct.append(_to_float(item.get("ram_percent")))
+            batch_ram_used.append(_to_float(item.get("ram_used_mb")))
+            batch_uptime.append(_to_float(item.get("uptime_s")))
+            batch_center.append(_to_float(item.get("center_hz")))
+            batch_tune_id.append(_to_uint32(item.get("tune_id")))
+            batch_gain.append(_to_float(item.get("gain_db")))
+            drained += 1
+
+        now = time.monotonic()
+        if batch_raw and (now - last_flush >= TELEM_BATCH_INTERVAL_S or len(batch_raw) >= 100):
+            new_size = row + len(batch_raw)
+            for name in ds:
+                ds[name].resize(new_size, axis=0)
+
+            ds["raw"][row:new_size] = batch_raw
+            ds["ts"][row:new_size] = np.array(batch_ts, dtype=np.float64)
+            ds["temp"][row:new_size] = np.array(batch_temp, dtype=np.float64)
+            ds["cpu"][row:new_size] = np.array(batch_cpu, dtype=np.float64)
+            ds["ram_pct"][row:new_size] = np.array(batch_ram_pct, dtype=np.float64)
+            ds["ram_used"][row:new_size] = np.array(batch_ram_used, dtype=np.float64)
+            ds["uptime"][row:new_size] = np.array(batch_uptime, dtype=np.float64)
+            ds["center"][row:new_size] = np.array(batch_center, dtype=np.float64)
+            ds["tune_id"][row:new_size] = np.array(batch_tune_id, dtype=np.uint32)
+            ds["gain"][row:new_size] = np.array(batch_gain, dtype=np.float64)
+
+            row += len(batch_raw)
+            batch_raw.clear()
+            batch_ts.clear()
+            batch_temp.clear()
+            batch_cpu.clear()
+            batch_ram_pct.clear()
+            batch_ram_used.clear()
+            batch_uptime.clear()
+            batch_center.clear()
+            batch_tune_id.clear()
+            batch_gain.clear()
+            last_flush = now
+            f.flush()
+
+        if (now - file_start) >= FILE_ROTATION_SEC:
+            f.flush()
+            f.close()
+            print(f"[TELEM-WRITER] Closed {filepath.name} ({row} events)")
+            f, ds, filepath = create_telem_file(output_dir)
+            print(f"[TELEM-WRITER] Opened {filepath.name}")
+            row = 0
+            file_start = time.monotonic()
+
+        if drained == 0:
+            time.sleep(0.005)
+
+    if batch_raw:
+        new_size = row + len(batch_raw)
+        for name in ds:
+            ds[name].resize(new_size, axis=0)
+        ds["raw"][row:new_size] = batch_raw
+        ds["ts"][row:new_size] = np.array(batch_ts, dtype=np.float64)
+        ds["temp"][row:new_size] = np.array(batch_temp, dtype=np.float64)
+        ds["cpu"][row:new_size] = np.array(batch_cpu, dtype=np.float64)
+        ds["ram_pct"][row:new_size] = np.array(batch_ram_pct, dtype=np.float64)
+        ds["ram_used"][row:new_size] = np.array(batch_ram_used, dtype=np.float64)
+        ds["uptime"][row:new_size] = np.array(batch_uptime, dtype=np.float64)
+        ds["center"][row:new_size] = np.array(batch_center, dtype=np.float64)
+        ds["tune_id"][row:new_size] = np.array(batch_tune_id, dtype=np.uint32)
+        ds["gain"][row:new_size] = np.array(batch_gain, dtype=np.float64)
+        row += len(batch_raw)
+
+    f.flush()
+    f.close()
+    print(f"[TELEM-WRITER] Final close {filepath.name} ({row} events)")
+
+
 # ── Main: ZMQ receive loop ────────────────────────────────────────────────────
 
 def main():
@@ -307,6 +493,7 @@ def main():
     parser.add_argument("--fft-port", type=int, default=5556, help="FFT ZMQ port")
     parser.add_argument("--output-dir", type=str, default="./spectrum_data",
                         help="Output directory for HDF5 files")
+    parser.add_argument("--telem-port", type=int, default=5557, help="Telemetry ZMQ port")
     parser.add_argument(
         "--drop-zero-frames",
         dest="drop_zero_frames",
@@ -328,8 +515,10 @@ def main():
     # Start writer threads
     t_fft = threading.Thread(target=fft_writer_thread, args=(output_dir,), daemon=True, name="fft_writer")
     t_sig = threading.Thread(target=sig_writer_thread, args=(output_dir,), daemon=True, name="sig_writer")
+    t_telem = threading.Thread(target=telem_writer_thread, args=(output_dir,), daemon=True, name="telem_writer")
     t_fft.start()
     t_sig.start()
+    t_telem.start()
 
     # ZMQ setup
     ctx = zmq.Context()
@@ -339,6 +528,11 @@ def main():
     sig_sock.setsockopt(zmq.RCVHWM, 500)
     sig_sock.connect(f"tcp://{args.host}:{args.sig_port}")
 
+    telem_sock = ctx.socket(zmq.SUB)
+    telem_sock.setsockopt(zmq.SUBSCRIBE, b"")
+    telem_sock.setsockopt(zmq.RCVHWM, 500)
+    telem_sock.connect(f"tcp://{args.host}:{args.telem_port}")
+
     fft_sock = ctx.socket(zmq.SUB)
     fft_sock.setsockopt(zmq.SUBSCRIBE, b"")
     fft_sock.setsockopt(zmq.RCVHWM, 200)
@@ -347,13 +541,15 @@ def main():
     poller = zmq.Poller()
     poller.register(sig_sock, zmq.POLLIN)
     poller.register(fft_sock, zmq.POLLIN)
+    poller.register(telem_sock, zmq.POLLIN)
 
     global fft_drops, sig_drops
     sig_count = 0
     fft_count = 0
+    telem_count = 0
     t0 = time.monotonic()
 
-    print(f"[RECV] Connected to {args.host}  sig:{args.sig_port}  fft:{args.fft_port}")
+    print(f"[RECV] Connected to {args.host}  sig:{args.sig_port}  fft:{args.fft_port}  telem:{args.telem_port}")
     print(f"[RECV] Storing to {output_dir.resolve()}")
     print(f"[RECV] drop_zero_frames={args.drop_zero_frames}")
     print("-" * 72)
@@ -391,6 +587,43 @@ def main():
                     print(
                         f"[SIG] #{sig_count}  center={center_mhz:.1f} MHz  "
                         f"signals={n}  noise={sig.get('noise_floor_db', 0):+.1f} dB"
+                    )
+
+            if telem_sock in events:
+                raw = telem_sock.recv()
+                try:
+                    telem = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                telem_count += 1
+                ts_str = telem.get("ts", "")
+                try:
+                    ts_epoch = datetime.fromisoformat(ts_str).timestamp()
+                except (ValueError, OSError):
+                    ts_epoch = time.time()
+
+                app_state = telem.get("app", {}) or {}
+                telem_queue.append({
+                    "raw_json": raw.decode("utf-8"),
+                    "ts_epoch": ts_epoch,
+                    "temp_c": telem.get("temp_c"),
+                    "cpu_percent": telem.get("cpu_percent"),
+                    "ram_percent": telem.get("ram_percent"),
+                    "ram_used_mb": telem.get("ram_used_mb"),
+                    "uptime_s": telem.get("uptime_s"),
+                    "center_hz": app_state.get("center_hz", 0),
+                    "tune_id": app_state.get("tune_id", 0),
+                    "gain_db": app_state.get("gain_db", 0),
+                })
+
+                if telem_count % 10 == 1:
+                    temp_c = telem.get("temp_c", None)
+                    cpu_pct = telem.get("cpu_percent", None)
+                    ram_pct = telem.get("ram_percent", None)
+                    gain_db = app_state.get("gain_db", None)
+                    print(
+                        f"[TELEM] #{telem_count} temp={temp_c} C cpu={cpu_pct}% ram={ram_pct}% gain={gain_db} dB"
                     )
 
             if fft_sock in events:
@@ -461,6 +694,7 @@ def main():
         # Wait for writers to flush
         t_fft.join(timeout=5.0)
         t_sig.join(timeout=5.0)
+        t_telem.join(timeout=5.0)
         print("[RECV] Writers shut down. Done.")
 
 
