@@ -31,6 +31,7 @@ from typing import List, Tuple
 
 import numpy as np
 from gnuradio import blocks, gr, uhd
+import pmt
 
 from shm_ring_buffer import ShmRingBuffer
 import psutil
@@ -74,8 +75,15 @@ DEBUG_FRAME_INDEX = 0
 LOG_QUEUE_MAXSIZE = 10000
 LOG_BATCH_SIZE = 200
 LOG_FLUSH_INTERVAL_S = 0.5
-# Drop vectors for a short window after each retune to avoid queued old-center frames.
-SETTLE_TIME_AFTER_TUNE_MS = 0.2
+# Timestamp/stale-frame handling.  UHD emits rx_time/rx_freq tags at stream
+# start and after a direct set_center_freq() call.  The custom FPGA keeps one
+# FFT frame out of every 50 raw FFT frames.
+FPGA_FRAME_DECIM = 50
+RX_FRAME_PERIOD_S = FFT_LEN * FPGA_FRAME_DECIM / RX_SAMP_RATE
+POST_TUNE_DISCARD_FRAMES = 1   # additionally discard one complete vector after tag boundary
+TUNE_TAG_TIMEOUT_S = 0.5
+RX_FREQ_TAG_TOLERANCE_HZ = 2e3
+TUNE_CAPTURE_GUARD_S = 0.0002
 
 # ── ZMQ streaming configuration ──────────────────────────────────────────────
 ZMQ_SIGNAL_PORT = 5555
@@ -91,7 +99,7 @@ SHM_FFT_NAME = "spec_fft_ring"
 SHM_SIG_SLOTS = 512
 SHM_SIG_SLOT_SIZE = 16384      # max JSON payload bytes per signal event
 SHM_FFT_SLOTS = 256
-SHM_FFT_SLOT_SIZE = 2048 + 512  # 2048 uint8 bins + up to 512 bytes JSON metadata
+SHM_FFT_SLOT_SIZE = 2048 + 768  # 2048 uint8 bins + timestamp-rich JSON metadata
 
 # FFT quantization
 FFT_QUANTIZE_DB_MIN = -120.0
@@ -195,12 +203,26 @@ def save_debug_frame(
     log(f"[DEBUG] saved_frame={file_path.name}")
 
 
-def compute_settle_frames() -> int:
-    # GR ring buffers (usrp_source → stream_to_vector → FrameProcessor)
-    # hold ~10-15 stale vectors after a retune.  We must discard all of
-    # them before running detection, otherwise we process data from the
-    # previous center frequency.  20 frames gives comfortable margin.
-    return 20
+def _pmt_rx_time_to_seconds(value) -> float | None:
+    """Convert UHD rx_time PMT tuple (whole seconds, fractional seconds)."""
+    try:
+        if not pmt.is_tuple(value) or pmt.length(value) < 2:
+            return None
+        whole = int(pmt.to_uint64(pmt.tuple_ref(value, 0)))
+        frac = float(pmt.to_double(pmt.tuple_ref(value, 1)))
+        return float(whole) + frac
+    except Exception:
+        return None
+
+
+def _pmt_number_to_float(value) -> float | None:
+    try:
+        return float(pmt.to_double(value))
+    except Exception:
+        try:
+            return float(pmt.to_python(value))
+        except Exception:
+            return None
 
 
 def detect_signals(
@@ -397,6 +419,14 @@ def _telemetry_publisher_thread(tb: 'RxTopBlock', port: int = ZMQ_TELEM_PORT, in
             app_state["center_hz"] = float(tb.center_hz)
             app_state["tune_id"] = int(tb.tune_id)
             app_state["gain_db"] = float(getattr(tb, "current_gain", RX_GAIN_DB))
+            fp = tb.frame_processor
+            app_state["timestamp_source"] = "uhd_rx_time"
+            app_state["stale_frames_discarded"] = int(fp.stale_frames_discarded)
+            app_state["timestamp_missing_frames"] = int(fp.timestamp_missing_frames)
+            app_state["timestamp_nonmonotonic_frames"] = int(fp.timestamp_nonmonotonic_frames)
+            app_state["tune_tag_timeouts"] = int(fp.tune_tag_timeouts)
+            app_state["usrp_host_time_offset_ms"] = float(tb.device_host_offset_s * 1e3)
+            app_state["usrp_time_read_rtt_ms"] = float(tb.device_time_read_rtt_s * 1e3)
         except Exception:
             pass
 
@@ -466,7 +496,7 @@ def _control_listener_thread(tb: 'RxTopBlock', port: int = ZMQ_CONTROL_PORT, bin
 
 
 class FrameProcessor(gr.sync_block):
-    """Consume vectorized complex FFT frames and run the same detector as dual_usrp_sweep."""
+    """Consume FFT vectors, preserve UHD acquisition time, and reject stale retune data."""
 
     def __init__(self, fft_len: int, center_hz: float, detect_every: int,
                  sig_ring: ShmRingBuffer = None, fft_ring: ShmRingBuffer = None):
@@ -482,15 +512,42 @@ class FrameProcessor(gr.sync_block):
         self.frame_counter = 0
         self.tune_id = 0
         self.frame_epoch = 0
-        self._discard_all = False   # when True, discard every frame
-        self._settled = threading.Event()  # signals retune_worker that settle is done
+
+        # Start fail-closed: no frame is published until a matching rx_freq/rx_time
+        # boundary has been seen for the requested tune.
+        self._discard_all = True
+        self._awaiting_tune_boundary = False
+        self._expected_freq_hz = None
+        self._minimum_rx_time = float("-inf")
+        self._matching_freq_tag_seen = False
+        self._matching_freq_tag_item = None
+        self._post_tune_discard_remaining = 0
+        self._settled = threading.Event()
+
+        # Acquisition-time reconstruction. rx_time gives an exact hardware-time
+        # anchor; subsequent kept FFT vectors are spaced by RX_FRAME_PERIOD_S.
+        self._time_anchor_item = None
+        self._time_anchor_secs = None
+        self._last_acq_time = None
+
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._detect_busy = False
         self._sig_ring = sig_ring
         self._fft_ring = fft_ring
 
+        self._rx_time_key = pmt.intern("rx_time")
+        self._rx_freq_key = pmt.intern("rx_freq")
+
+        # Diagnostic counters exposed through telemetry.
+        self.stale_frames_discarded = 0
+        self.timestamp_missing_frames = 0
+        self.timestamp_nonmonotonic_frames = 0
+        self.tune_tag_timeouts = 0
+        self._discarded_this_tune = 0
+
     def begin_tune(self, tune_id: int, freq_hz: float):
+        """Arm a new tune and reject all queued data until its UHD tags arrive."""
         with self._cv:
             while self._detect_busy:
                 self._cv.wait(timeout=0.01)
@@ -498,28 +555,156 @@ class FrameProcessor(gr.sync_block):
             self.center_hz = float(freq_hz)
             self.frame_epoch = 0
             self._discard_all = True
+            self._awaiting_tune_boundary = True
+            self._expected_freq_hz = float(freq_hz)
+            self._minimum_rx_time = float("inf")
+            self._matching_freq_tag_seen = False
+            self._matching_freq_tag_item = None
+            self._post_tune_discard_remaining = 0
+            self._discarded_this_tune = 0
             self._settled.clear()
 
-    def mark_settled(self):
-        """Called by retune_worker after dwell sleep to start collecting."""
+    def complete_tune(self, minimum_rx_time: float):
+        """Publish the first acceptable hardware time after set_center_freq returns."""
         with self._lock:
-            self._discard_all = False
-        self._settled.set()
+            self._minimum_rx_time = float(minimum_rx_time)
+
+    def wait_until_settled(self, timeout_s: float) -> bool:
+        ok = self._settled.wait(timeout=max(0.0, float(timeout_s)))
+        if not ok:
+            with self._lock:
+                self.tune_tag_timeouts += 1
+        return ok
+
+    def is_settled(self) -> bool:
+        return self._settled.is_set()
+
+    def _process_tags_for_item(self, abs_item: int, item_tags) -> bool:
+        """Update time/frequency tag state. Return True for the tune-boundary frame."""
+        rx_time = None
+        rx_freq = None
+
+        for tag in item_tags:
+            try:
+                key = pmt.symbol_to_string(tag.key)
+            except Exception:
+                continue
+            if key == "rx_time":
+                rx_time = _pmt_rx_time_to_seconds(tag.value)
+            elif key == "rx_freq":
+                rx_freq = _pmt_number_to_float(tag.value)
+
+        if rx_time is not None:
+            self._time_anchor_item = int(abs_item)
+            self._time_anchor_secs = float(rx_time)
+
+        if not self._awaiting_tune_boundary:
+            return False
+
+        if rx_freq is not None and self._expected_freq_hz is not None:
+            if abs(rx_freq - self._expected_freq_hz) <= RX_FREQ_TAG_TOLERANCE_HZ:
+                self._matching_freq_tag_seen = True
+                self._matching_freq_tag_item = int(abs_item)
+
+        # set_center_freq() may set _tag_now while old packets are still queued.
+        # Therefore the new rx_freq tag alone is NOT sufficient: it can be attached
+        # to stale data.  Reconstruct the hardware acquisition time of the current
+        # vector and wait until it is newer than the time at which tuning completed.
+        current_acq_time = self._acquisition_time_for_item(abs_item)
+        freq_boundary_reached = (
+            self._matching_freq_tag_seen
+            and self._matching_freq_tag_item is not None
+            and abs_item >= self._matching_freq_tag_item
+        )
+        time_boundary_valid = (
+            current_acq_time is not None
+            and current_acq_time >= self._minimum_rx_time
+        )
+
+        if not (freq_boundary_reached and time_boundary_valid):
+            return False
+
+        self._awaiting_tune_boundary = False
+        self._post_tune_discard_remaining = POST_TUNE_DISCARD_FRAMES
+        return True
+
+    def _acquisition_time_for_item(self, abs_item: int) -> float | None:
+        if self._time_anchor_item is None or self._time_anchor_secs is None:
+            return None
+        delta_frames = int(abs_item) - int(self._time_anchor_item)
+        return float(self._time_anchor_secs) + delta_frames * RX_FRAME_PERIOD_S
 
     def work(self, input_items, output_items):
         frames = input_items[0]
+        base_abs_item = int(self.nitems_read(0))
+
+        tags_by_offset = {}
+        try:
+            for tag in self.get_tags_in_window(0, 0, len(frames)):
+                tags_by_offset.setdefault(int(tag.offset), []).append(tag)
+        except Exception as e:
+            log(f"[TAG][ERROR] get_tags_in_window failed: {e}")
+
         for i in range(len(frames)):
+            abs_item = base_abs_item + i
             vec = np.asarray(frames[i], dtype=np.complex64)
             self.frame_counter += 1
             should_detect = False
+            drop_frame = False
 
             with self._lock:
+                boundary_frame = self._process_tags_for_item(
+                    abs_item, tags_by_offset.get(abs_item, ())
+                )
+
+                # Drop the first vector whose acquisition time crosses the clean
+                # post-tune boundary. It may still straddle the hardware transition.
+                if boundary_frame:
+                    self.stale_frames_discarded += 1
+                    self._discarded_this_tune += 1
+                    drop_frame = True
+
+                elif self._awaiting_tune_boundary:
+                    self.stale_frames_discarded += 1
+                    self._discarded_this_tune += 1
+                    drop_frame = True
+
+                elif self._post_tune_discard_remaining > 0:
+                    self._post_tune_discard_remaining -= 1
+                    self.stale_frames_discarded += 1
+                    self._discarded_this_tune += 1
+                    drop_frame = True
+                    if self._post_tune_discard_remaining == 0:
+                        self._discard_all = False
+                        self._settled.set()
+                        log(
+                            f"[RX] tune_id={self.tune_id} clean boundary ready | "
+                            f"discarded_vectors={self._discarded_this_tune}"
+                        )
+
+                elif self._discard_all:
+                    drop_frame = True
+
+                if drop_frame:
+                    continue
+
                 tune_id = self.tune_id
                 center_hz = self.center_hz
-                if self._discard_all:
-                    continue
                 frame_epoch = self.frame_epoch
                 self.frame_epoch += 1
+                acq_time = self._acquisition_time_for_item(abs_item)
+
+                if acq_time is None:
+                    self.timestamp_missing_frames += 1
+                    continue
+                if self._last_acq_time is not None and acq_time <= self._last_acq_time:
+                    self.timestamp_nonmonotonic_frames += 1
+                    log(
+                        f"[TAG][WARN] non-monotonic rx_time: current={acq_time:.9f} "
+                        f"previous={self._last_acq_time:.9f}"
+                    )
+                    continue
+                self._last_acq_time = acq_time
 
                 if frame_epoch + 1 == DEBUG_FRAME_INDEX:
                     save_debug_frame(vec, tune_id, center_hz, frame_epoch)
@@ -528,20 +713,28 @@ class FrameProcessor(gr.sync_block):
                     self._detect_busy = True
                     should_detect = True
 
+            process_time = time.time()
+            acq_iso = datetime.fromtimestamp(acq_time, timezone.utc).isoformat()
+            process_iso = datetime.fromtimestamp(process_time, timezone.utc).isoformat()
+
             # ── Stream quantized FFT to ring buffer ──────────────────
             if self._fft_ring is not None and frame_epoch % FFT_STREAM_DECIMATION == 0:
                 fft_uint8 = quantize_fft_to_uint8(vec)
                 meta = json.dumps({
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": acq_iso,                  # HDF5 timestamp = RF acquisition time
+                    "ts_epoch": acq_time,
+                    "process_ts": process_iso,     # separate host processing timestamp
+                    "timestamp_source": "uhd_rx_time",
                     "tune_id": tune_id,
                     "center_hz": center_hz,
-                    "sr": RX_BW,
+                    "sample_rate_hz": RX_SAMP_RATE,
+                    "analog_bandwidth_hz": RX_BW,
                     "fft_len": self.fft_len,
+                    "frame_period_s": RX_FRAME_PERIOD_S,
                     "db_min": FFT_QUANTIZE_DB_MIN,
                     "db_max": FFT_QUANTIZE_DB_MAX,
                     "epoch": frame_epoch,
                 }, separators=(",", ":")).encode("utf-8")
-                # Pack: [2-byte meta_len][meta][fft_uint8]
                 slot_data = struct.pack("<H", len(meta)) + meta + fft_uint8.tobytes()
                 self._fft_ring.write(slot_data)
 
@@ -552,14 +745,17 @@ class FrameProcessor(gr.sync_block):
                 noise_floor, threshold, signals, g_bin, g_freq = detect_signals(vec, center_hz)
 
                 with self._cv:
-                    # Handshake invariant: retune waits until this detect section exits.
+                    # Retune waits until this detect section exits.
                     if not self._discard_all and self.tune_id == tune_id and signals:
-                        # ── Stream detected signals to ring buffer ────
                         if self._sig_ring is not None:
                             sig_payload = json.dumps({
-                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "ts": acq_iso,
+                                "ts_epoch": acq_time,
+                                "process_ts": process_iso,
+                                "timestamp_source": "uhd_rx_time",
                                 "tune_id": tune_id,
                                 "center_hz": center_hz,
+                                "frame_epoch": frame_epoch,
                                 "noise_floor_db": noise_floor,
                                 "threshold_db": threshold,
                                 "signals": signals,
@@ -568,11 +764,13 @@ class FrameProcessor(gr.sync_block):
 
                         for sig in signals:
                             log(
-                                "[SIG] tune_id={} | frame_epoch={} | F={:.1f} MHz | peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | "
-                                "freq={:.3f} MHz | width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
+                                "[SIG] tune_id={} | frame_epoch={} | t_acq={:.6f} | F={:.1f} MHz | "
+                                "peak_bin={} | peak={:+.1f} dB | snr={:.1f} dB | freq={:.3f} MHz | "
+                                "width={:.1f} kHz | noise={:+.1f} dB | thr={:+.1f} dB | "
                                 "g_argmax_bin={} | g_argmax_freq={:.3f} MHz".format(
                                     tune_id,
                                     frame_epoch,
+                                    acq_time,
                                     center_hz / 1e6,
                                     sig["peak_bin"],
                                     sig["peak_db"],
@@ -627,6 +825,40 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_rx_agc(False, 0)
         #self.usrp_source.set_bandwidth(8e6, 0)
 
+        # Map B210 hardware time to the Pi's PTP-disciplined CLOCK_REALTIME.
+        # Repeated set/readback compensates most USB control-path delay.  The final
+        # measured residual is logged and must still be checked for short-burst POI.
+        try:
+            residual_s = 0.0
+            for _ in range(3):
+                target = time.time() - residual_s
+                try:
+                    self.usrp_source.set_time_now(uhd.time_spec(target), 0)
+                except TypeError:
+                    self.usrp_source.set_time_now(uhd.time_spec(target))
+                time.sleep(0.01)
+                t0 = time.time()
+                device_now = self.usrp_source.get_time_now(0).get_real_secs()
+                t1 = time.time()
+                residual_s = float(device_now - 0.5 * (t0 + t1))
+
+            residual_samples = []
+            rtt_samples = []
+            for _ in range(5):
+                t0 = time.time()
+                device_now = self.usrp_source.get_time_now(0).get_real_secs()
+                t1 = time.time()
+                residual_samples.append(float(device_now - 0.5 * (t0 + t1)))
+                rtt_samples.append(float(t1 - t0))
+            self.device_host_offset_s = float(np.median(residual_samples))
+            self.device_time_read_rtt_s = float(np.median(rtt_samples))
+            log(
+                f"[TIME] RX USRP-host residual={self.device_host_offset_s*1e3:+.3f} ms | "
+                f"median_read_RTT={self.device_time_read_rtt_s*1e3:.3f} ms"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Cannot synchronize/read RX USRP hardware time: {e}") from e
+
         self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex * 1, FFT_LEN)
         self.frame_processor = FrameProcessor(
             FFT_LEN, self.center_hz, DETECT_EVERY,
@@ -639,20 +871,35 @@ class RxTopBlock(gr.top_block):
         self.tune_id = 0
         self.set_center_freq(self.center_hz)
 
-    def set_center_freq(self, freq_hz: float):
+    def _device_time_now(self) -> float:
+        try:
+            return float(self.usrp_source.get_time_now(0).get_real_secs())
+        except TypeError:
+            return float(self.usrp_source.get_time_now().get_real_secs())
+
+    def set_center_freq(self, freq_hz: float, force: bool = False) -> bool:
         new_freq = float(freq_hz)
-        if self.center_hz == new_freq:
-            return
+        if not force and self.center_hz == new_freq:
+            return False
 
         self.center_hz = new_freq
         self.tune_id += 1
-        # Tell FrameProcessor to discard ALL frames from now on
+
+        # Reject queued vectors before issuing the tune. A new rx_freq/rx_time tag
+        # will be observed downstream, but acceptance additionally requires the
+        # reconstructed acquisition time to be newer than tune completion.
         self.frame_processor.begin_tune(self.tune_id, self.center_hz)
-        # Hardware tune (3-107 ms) — FrameProcessor discards during this
         self.usrp_source.set_center_freq(self.center_hz, 0)
-        log(
-            f"[RX] tune_id={self.tune_id} -> {self.center_hz/1e6:.1f} MHz"
+        tune_done_device_time = self._device_time_now()
+        self.frame_processor.complete_tune(
+            tune_done_device_time + TUNE_CAPTURE_GUARD_S
         )
+        actual_freq = float(self.usrp_source.get_center_freq(0))
+        log(
+            f"[RX] tune_id={self.tune_id} requested={self.center_hz/1e6:.6f} MHz "
+            f"actual={actual_freq/1e6:.6f} MHz | waiting for rx_freq/rx_time boundary"
+        )
+        return True
 
     def set_gain(self, gain_db: float):
         try:
@@ -664,19 +911,22 @@ class RxTopBlock(gr.top_block):
 
 
 def run_warmup_and_optional_sweep(tb: RxTopBlock):
-    # Match signal_detection warm-up sequence: 400 -> (0.5s) 900 -> (0.2s) 500
     time.sleep(RX_WARMUP_DELAY_S)
     if stop_event.is_set():
         return
 
     tb.set_center_freq(RX_WARMUP_HZ)
+    # Warm-up time is still host-controlled; stale vectors are rejected by tags.
     time.sleep(RX_WARMUP_HOLD_S)
     if stop_event.is_set():
         return
 
     tb.set_center_freq(RX_FINAL_HZ)
-    # For non-sweep mode, enable collection immediately
-    tb.frame_processor.mark_settled()
+    if not tb.frame_processor.wait_until_settled(TUNE_TAG_TIMEOUT_S):
+        log(
+            f"[RX][ERROR] no clean rx_freq/rx_time boundary for initial "
+            f"{RX_FINAL_HZ/1e6:.1f} MHz tune"
+        )
 
     if not SWEEP_ENABLE:
         return
@@ -685,19 +935,28 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
     center_hz = RX_FINAL_HZ
     loop_idx = 0
     prev_tune_ts = time.perf_counter()
+
     while not stop_event.is_set():
         tune_start = time.perf_counter()
-        tb.set_center_freq(center_hz)
-        tune_end = time.perf_counter()
+        changed = tb.set_center_freq(center_hz)
+        tune_call_end = time.perf_counter()
 
-        # Phase 1: flush — FrameProcessor discards all frames while
-        # stale GR buffer data drains out (tune_call + dwell_s)
-        time.sleep(dwell_s/20)
+        settled_ok = tb.frame_processor.is_settled()
+        if changed:
+            settled_ok = tb.frame_processor.wait_until_settled(TUNE_TAG_TIMEOUT_S)
+        tune_ready = time.perf_counter()
 
-        # Phase 2: collect — enable detection on clean data
-        tb.frame_processor.mark_settled()
-        time.sleep(dwell_s)
-        sleep_end = time.perf_counter()
+        if not settled_ok:
+            log(
+                f"[RX][ERROR] tune_id={tb.tune_id} center={center_hz/1e6:.1f} MHz "
+                f"timed out waiting for clean tagged boundary; dwell skipped"
+            )
+        else:
+            # Dwell starts only after stale vectors and the boundary vector have been
+            # discarded. Every published frame now belongs to this center frequency.
+            time.sleep(dwell_s)
+
+        dwell_end = time.perf_counter()
 
         center_hz += RX_STEP_HZ
         if center_hz > RX_STOP_HZ:
@@ -705,16 +964,18 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
 
         loop_idx += 1
         if MEASURE_SWEEP_TIMING and (loop_idx % max(1, SWEEP_TIMING_LOG_EVERY) == 0):
-            sleep_ms = (sleep_end - tune_end) * 1000.0
-            tune_ms = (tune_end - tune_start) * 1000.0
+            tune_call_ms = (tune_call_end - tune_start) * 1000.0
+            tag_wait_ms = (tune_ready - tune_call_end) * 1000.0
+            dwell_ms = (dwell_end - tune_ready) * 1000.0 if settled_ok else 0.0
             interval_ms = (tune_start - prev_tune_ts) * 1000.0
             log(
-                "[TIMING] loop={} | target={:.3f} ms | sleep={:.3f} ms | tune_call={:.3f} ms | "
-                "interval_between_tunes={:.3f} ms".format(
+                "[TIMING] loop={} | target_dwell={:.3f} ms | actual_dwell={:.3f} ms | "
+                "tune_call={:.3f} ms | tag_wait={:.3f} ms | interval_between_tunes={:.3f} ms".format(
                     loop_idx,
                     SWEEP_DWELL_MS,
-                    sleep_ms,
-                    tune_ms,
+                    dwell_ms,
+                    tune_call_ms,
+                    tag_wait_ms,
                     interval_ms,
                 )
             )

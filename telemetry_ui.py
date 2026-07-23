@@ -2,7 +2,7 @@
 """Terminal UI for telemetry monitoring and gain control.
 
 - SUB telemetry from tcp://<host>:5557
-- PUSH control commands to tcp://<host>:5558
+- REQ control commands to tcp://<host>:5558
 """
 
 import argparse
@@ -75,10 +75,12 @@ def tui_main(stdscr, host: str, telem_port: int, control_port: int):
     ctx = zmq.Context()
     state = TelemetryState()
 
-    # Control socket (PUSH) for one-way commands
-    control_sock = ctx.socket(zmq.PUSH)
+    # Control socket (REQ) for request/reply commands
+    control_sock = ctx.socket(zmq.REQ)
     control_sock.setsockopt(zmq.SNDHWM, 10)
     control_sock.connect(f"tcp://{host}:{control_port}")
+    control_poller = zmq.Poller()
+    control_poller.register(control_sock, zmq.POLLIN)
 
     recv_thread = threading.Thread(
         target=telemetry_worker,
@@ -114,10 +116,23 @@ def tui_main(stdscr, host: str, telem_port: int, control_port: int):
                         payload = {"action": "set_gain", "value": gain_value}
                         try:
                             control_sock.send_json(payload, flags=zmq.NOBLOCK)
-                            info_msg = f"Sent set_gain {gain_value:.2f}"
-                            error_msg = ""
+                            events = dict(control_poller.poll(timeout=500))
+                            if control_sock in events:
+                                reply = control_sock.recv_json()
+                                if reply.get("status") == "success":
+                                    info_msg = reply.get("msg", "Gain updated")
+                                    error_msg = ""
+                                else:
+                                    error_msg = reply.get("msg", "Error: command rejected")
+                                    info_msg = ""
+                            else:
+                                error_msg = "Error: No reply from control server."
+                                info_msg = ""
                         except zmq.Again:
                             error_msg = "Error: Control socket busy. Try again."
+                            info_msg = ""
+                        except ValueError:
+                            error_msg = "Error: Invalid reply format."
                             info_msg = ""
                 elif ch in (curses.KEY_BACKSPACE, 127, 8):
                     input_buf = input_buf[:-1]

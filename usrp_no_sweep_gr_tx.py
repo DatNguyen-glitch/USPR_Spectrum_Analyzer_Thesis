@@ -2,16 +2,23 @@
 """
 RX-only controller using GNU Radio top_block (no GUI).
 
-Flow:
-- RX: uhd.usrp_source -> blocks.stream_to_vector(FFT_LEN) -> FrameProcessor
+Fixed-frequency variant: the frequency sweep has been removed. The receiver
+tunes once to a user-supplied center frequency and can be re-tuned live by
+typing a new frequency into the terminal.
 
-Streaming:
+Flow (unchanged from the sweep version):
+- RX: uhd.usrp_source -> blocks.stream_to_vector(FFT_LEN) -> FrameProcessor
 - FrameProcessor writes detected signals + quantized FFT into two shared-memory
   SPSC ring buffers.
 - Two separate processes (signal_publisher, fft_publisher) read from the ring
   buffers and publish via ZMQ PUB sockets.
 - Main process (GNU Radio + detection) pinned to cores 0-1.
 - Signal publisher pinned to core 3, FFT publisher pinned to core 2.
+
+Tuning:
+- Initial center frequency is taken from the --freq command-line argument (MHz).
+- While running, type a frequency in MHz at the terminal prompt to retune live;
+  type 'q' (or 'quit'/'exit') to stop. Use --no-interactive to disable this.
 """
 
 import atexit
@@ -23,7 +30,6 @@ import signal as signal_mod
 import struct
 import threading
 import time
-import math
 import queue
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,45 +43,36 @@ import psutil
 import zmq
 
 
-RX_SERIAL = "34D628E"
-FPGA_BIN = "/home/datnguyen/USRP_Spectrum_Analyzer_Thesis/b200_fixed_18h_1905.bin"
+RX_SERIAL = "34D62A7"
+FPGA_BIN = "/home/datnguyen/Downloads/USRP_B210_FPGA_Thesis/FPGA_bin_files/b200_copilot_14h45_2105.bin"
 
-RX_SAMP_RATE 	= 50e6
-RX_BW 		= 30e6
-RX_GAIN_DB 	= 15
-RX_START_HZ 	= 358e6
-RX_STOP_HZ 	= 508e6
-RX_STEP_HZ 	= 25e6
-RX_INIT_HZ 	= 400e6
-RX_WARMUP_HZ 	= 500e6
-RX_FINAL_HZ 	= 358e6
+RX_SAMP_RATE    = 50e6
+RX_BW           = 50e6
+RX_GAIN_DB = 22
+RX_INIT_HZ = 4e8           # USRP source init frequency (before warm-up)
+RX_WARMUP_HZ = 5e8
 RX_WARMUP_DELAY_S = 1
-RX_WARMUP_HOLD_S  = 1
+RX_WARMUP_HOLD_S = 1
+RX_DEFAULT_HZ = 5e8        # default target frequency if --freq not given
 FFT_LEN = 2048
-SWEEP_ENABLE = True
-SWEEP_DWELL_MS = 15
-MEASURE_SWEEP_TIMING = True
-SWEEP_TIMING_LOG_EVERY = 1
+
+# Settle time after a manual tune before re-enabling collection.
+TUNE_SETTLE_S = 0.2
 
 DETECT_MARGIN_DB = 4.0
-# MIN_SIGNAL_BINS = 2
 MIN_SIGNAL_BINS = 4
 MIN_PEAK_SNR_DB = 10
-# EDGE_GUARD_BINS = 20
-# DC_GUARD_BINS = 24
 EDGE_GUARD_BINS = 40
 DC_GUARD_BINS = 48
 DC_GUARD_HZ = 1.5e6
 
 DETECT_EVERY = 5
-LOG_FILE = Path(__file__).resolve().with_name("sweep_gr.log")
+LOG_FILE = Path(__file__).resolve().with_name("fixed_freq_gr.log")
 DEBUG_FRAME_DIR = Path(__file__).resolve().with_name("debug_frames")
-DEBUG_FRAME_INDEX = 0
+DEBUG_FRAME_INDEX = 5
 LOG_QUEUE_MAXSIZE = 10000
 LOG_BATCH_SIZE = 200
 LOG_FLUSH_INTERVAL_S = 0.5
-# Drop vectors for a short window after each retune to avoid queued old-center frames.
-SETTLE_TIME_AFTER_TUNE_MS = 0.2
 
 # ── ZMQ streaming configuration ──────────────────────────────────────────────
 ZMQ_SIGNAL_PORT = 5555
@@ -98,7 +95,7 @@ FFT_QUANTIZE_DB_MIN = -120.0
 FFT_QUANTIZE_DB_MAX = 0.0
 
 # Send every Nth FFT frame to ZMQ (bandwidth reduction)
-FFT_STREAM_DECIMATION = 1
+FFT_STREAM_DECIMATION = 5
 
 # CPU core pinning (Pi 5 has cores 0-3)
 CORES_MAIN = {0, 1}   # GNU Radio + detection
@@ -193,14 +190,6 @@ def save_debug_frame(
         fft_len=np.int32(frame_vec.size),
     )
     log(f"[DEBUG] saved_frame={file_path.name}")
-
-
-def compute_settle_frames() -> int:
-    # GR ring buffers (usrp_source → stream_to_vector → FrameProcessor)
-    # hold ~10-15 stale vectors after a retune.  We must discard all of
-    # them before running detection, otherwise we process data from the
-    # previous center frequency.  20 frames gives comfortable margin.
-    return 20
 
 
 def detect_signals(
@@ -466,7 +455,7 @@ def _control_listener_thread(tb: 'RxTopBlock', port: int = ZMQ_CONTROL_PORT, bin
 
 
 class FrameProcessor(gr.sync_block):
-    """Consume vectorized complex FFT frames and run the same detector as dual_usrp_sweep."""
+    """Consume vectorized complex FFT frames and run signal detection + FFT streaming."""
 
     def __init__(self, fft_len: int, center_hz: float, detect_every: int,
                  sig_ring: ShmRingBuffer = None, fft_ring: ShmRingBuffer = None):
@@ -483,7 +472,7 @@ class FrameProcessor(gr.sync_block):
         self.tune_id = 0
         self.frame_epoch = 0
         self._discard_all = False   # when True, discard every frame
-        self._settled = threading.Event()  # signals retune_worker that settle is done
+        self._settled = threading.Event()  # signals tuner that settle is done
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._detect_busy = False
@@ -501,7 +490,7 @@ class FrameProcessor(gr.sync_block):
             self._settled.clear()
 
     def mark_settled(self):
-        """Called by retune_worker after dwell sleep to start collecting."""
+        """Called after the dwell/settle sleep to start collecting."""
         with self._lock:
             self._discard_all = False
         self._settled.set()
@@ -535,7 +524,7 @@ class FrameProcessor(gr.sync_block):
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "tune_id": tune_id,
                     "center_hz": center_hz,
-                    "sr": RX_BW,
+                    "sr": RX_SAMP_RATE,
                     "fft_len": self.fft_len,
                     "db_min": FFT_QUANTIZE_DB_MIN,
                     "db_max": FFT_QUANTIZE_DB_MAX,
@@ -595,7 +584,7 @@ class FrameProcessor(gr.sync_block):
 
 class RxTopBlock(gr.top_block):
     def __init__(self, sig_ring=None, fft_ring=None):
-        gr.top_block.__init__(self, "dual_usrp_sweep_gr_rx", catch_exceptions=True)
+        gr.top_block.__init__(self, "usrp_fixed_freq_gr_rx", catch_exceptions=True)
 
         self.center_hz = RX_INIT_HZ
 
@@ -625,7 +614,6 @@ class RxTopBlock(gr.top_block):
         self.usrp_source.set_auto_dc_offset(True, 0)
         self.usrp_source.set_auto_iq_balance(True, 0)
         self.usrp_source.set_rx_agc(False, 0)
-        #self.usrp_source.set_bandwidth(8e6, 0)
 
         self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex * 1, FFT_LEN)
         self.frame_processor = FrameProcessor(
@@ -649,7 +637,11 @@ class RxTopBlock(gr.top_block):
         # Tell FrameProcessor to discard ALL frames from now on
         self.frame_processor.begin_tune(self.tune_id, self.center_hz)
         # Hardware tune (3-107 ms) — FrameProcessor discards during this
+        t0 = time.perf_counter()
         self.usrp_source.set_center_freq(self.center_hz, 0)
+        t1 = time.perf_counter()
+        tune_ms = (t1 - t0) * 1000
+        print(f"Tune ms: {tune_ms:.1f}", flush=True)
         log(
             f"[RX] tune_id={self.tune_id} -> {self.center_hz/1e6:.1f} MHz"
         )
@@ -663,8 +655,24 @@ class RxTopBlock(gr.top_block):
             log(f"[RX] set_gain_failed: {e}")
 
 
-def run_warmup_and_optional_sweep(tb: RxTopBlock):
-    # Match signal_detection warm-up sequence: 400 -> (0.5s) 900 -> (0.2s) 500
+def tune_to(tb: RxTopBlock, freq_hz: float):
+    """Retune the receiver and re-enable collection after a short settle.
+
+    Mirrors the flush/collect handshake the sweep loop used: begin_tune
+    (inside set_center_freq) discards stale GR-buffered frames, then after
+    a settle delay mark_settled() re-enables detection on clean data.
+    """
+    tb.set_center_freq(freq_hz)
+    time.sleep(TUNE_SETTLE_S)
+    tb.frame_processor.mark_settled()
+
+
+def run_warmup_and_tune(tb: RxTopBlock, target_hz: float):
+    """Warm up the USRP PLL/AGC, then settle at the requested fixed frequency.
+
+    Keeps the original warm-up sequence (init -> warmup -> target) but does
+    NOT sweep: it tunes once to `target_hz` and enables collection.
+    """
     time.sleep(RX_WARMUP_DELAY_S)
     if stop_event.is_set():
         return
@@ -674,52 +682,47 @@ def run_warmup_and_optional_sweep(tb: RxTopBlock):
     if stop_event.is_set():
         return
 
-    tb.set_center_freq(RX_FINAL_HZ)
-    # For non-sweep mode, enable collection immediately
+    tb.set_center_freq(target_hz)
     tb.frame_processor.mark_settled()
+    log(f"[RX] fixed_freq={target_hz/1e6:.3f} MHz (collection enabled)")
 
-    if not SWEEP_ENABLE:
+
+def _terminal_tune_thread(tb: RxTopBlock, target_hz: float, interactive: bool):
+    """Warm up, settle at target_hz, then (optionally) read MHz from stdin to retune."""
+    run_warmup_and_tune(tb, target_hz)
+
+    if not interactive:
         return
 
-    dwell_s = SWEEP_DWELL_MS / 1000.0
-    center_hz = RX_FINAL_HZ
-    loop_idx = 0
-    prev_tune_ts = time.perf_counter()
+    print(
+        "\n[tuner] Enter a center frequency in MHz to retune "
+        "(e.g. 868), or 'q' to quit.\n",
+        flush=True,
+    )
     while not stop_event.is_set():
-        tune_start = time.perf_counter()
-        tb.set_center_freq(center_hz)
-        tune_end = time.perf_counter()
+        try:
+            line = input("freq (MHz) > ").strip()
+        except (EOFError, OSError):
+            break  # stdin closed (e.g. running detached) — keep collecting
 
-        # Phase 1: flush — FrameProcessor discards all frames while
-        # stale GR buffer data drains out (tune_call + dwell_s)
-        time.sleep(dwell_s/20)
+        if not line:
+            continue
+        if line.lower() in ("q", "quit", "exit"):
+            stop_event.set()
+            break
 
-        # Phase 2: collect — enable detection on clean data
-        tb.frame_processor.mark_settled()
-        time.sleep(dwell_s)
-        sleep_end = time.perf_counter()
+        try:
+            freq_mhz = float(line)
+        except ValueError:
+            print("  invalid input — enter a number in MHz (e.g. 868)", flush=True)
+            continue
 
-        center_hz += RX_STEP_HZ
-        if center_hz > RX_STOP_HZ:
-            center_hz = RX_START_HZ
+        if freq_mhz <= 0:
+            print("  frequency must be positive", flush=True)
+            continue
 
-        loop_idx += 1
-        if MEASURE_SWEEP_TIMING and (loop_idx % max(1, SWEEP_TIMING_LOG_EVERY) == 0):
-            sleep_ms = (sleep_end - tune_end) * 1000.0
-            tune_ms = (tune_end - tune_start) * 1000.0
-            interval_ms = (tune_start - prev_tune_ts) * 1000.0
-            log(
-                "[TIMING] loop={} | target={:.3f} ms | sleep={:.3f} ms | tune_call={:.3f} ms | "
-                "interval_between_tunes={:.3f} ms".format(
-                    loop_idx,
-                    SWEEP_DWELL_MS,
-                    sleep_ms,
-                    tune_ms,
-                    interval_ms,
-                )
-            )
-
-        prev_tune_ts = tune_start
+        tune_to(tb, freq_mhz * 1e6)
+        print(f"  tuned to {freq_mhz:.3f} MHz", flush=True)
 
 
 def _cleanup_shm(*names):
@@ -734,7 +737,30 @@ def _cleanup_shm(*names):
             pass
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Fixed-frequency USRP RX controller (no sweep). "
+                    "Tune from the terminal."
+    )
+    parser.add_argument(
+        "--freq", type=float, default=RX_DEFAULT_HZ / 1e6,
+        help="Initial center frequency in MHz (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--gain", type=float, default=RX_GAIN_DB,
+        help="RX gain in dB (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--no-interactive", action="store_true",
+        help="Do not read frequencies from stdin; just hold the initial frequency.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    target_hz = args.freq * 1e6
+
     # ── Pin main process to cores 0-1 ────────────────────────────────────
     try:
         os.sched_setaffinity(0, CORES_MAIN)
@@ -768,6 +794,8 @@ def main():
 
     # ── GNU Radio top block (runs in main process) ────────────────────────
     tb = RxTopBlock(sig_ring=sig_ring, fft_ring=fft_ring)
+    tb.set_gain(args.gain)
+
     log_thread = threading.Thread(target=_log_writer_worker, daemon=True)
     telem_thread = threading.Thread(target=_telemetry_publisher_thread, args=(tb, ZMQ_TELEM_PORT), daemon=True)
     control_thread = threading.Thread(
@@ -788,8 +816,14 @@ def main():
     control_thread.start()
     tb.start()
 
-    ctrl_thread = threading.Thread(target=run_warmup_and_optional_sweep, args=(tb,), daemon=True)
-    ctrl_thread.start()
+    # Warm-up + terminal tuning (replaces the sweep control thread)
+    tuner_thread = threading.Thread(
+        target=_terminal_tune_thread,
+        args=(tb, target_hz, not args.no_interactive),
+        daemon=True,
+        name="terminal_tuner",
+    )
+    tuner_thread.start()
 
     while not stop_event.is_set():
         time.sleep(0.2)
@@ -797,7 +831,7 @@ def main():
     # ── Shutdown ──────────────────────────────────────────────────────────
     tb.stop()
     tb.wait()
-    ctrl_thread.join(timeout=1.0)
+    tuner_thread.join(timeout=1.0)
 
     # Terminate publisher processes
     for p in (sig_pub, fft_pub):
@@ -805,7 +839,7 @@ def main():
             p.terminate()
             p.join(timeout=2.0)
 
-    # Wait for telemetry thread to stop
+    # Wait for telemetry / control threads to stop
     telem_thread.join(timeout=2.0)
     control_thread.join(timeout=2.0)
 

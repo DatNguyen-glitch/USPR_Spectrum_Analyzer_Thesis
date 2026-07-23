@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 TX-only controller using GNU Radio top_block (no GUI).
-
-Flow:
-- TX: analog.sig_source_c (Complex Sine Wave) -> uhd.usrp_sink
-  (Old file_source for QPSK is commented out)
 """
 
 import signal
@@ -29,14 +25,15 @@ TX_SERIAL = "34D62A7"
 
 # ==============================================================================
 # --- NEW SINE WAVE (CW) CONFIGURATION ---
-TX_SAMP_RATE = 5e6          # Lấy mẫu 5M là quá đủ cho sóng đơn tần
-TX_GAIN_DB = 78             # CRITICAL: Bắt buộc hạ Gain xuống 35-40 để chống bão hòa ADC bên máy thu
-TX_BW_HZ = 5e6              # Mở bộ lọc analog 5M
-IF_OFFSET_HZ = 1e6          # Dịch tần baseband 1MHz để né nhiễu LO Leakage
-TX_AMPLITUDE = 0.3          # Biên độ số 0.3 để tránh tràn DAC
+TX_SAMP_RATE = 8e6          # Lấy mẫu 5M là quá đủ cho sóng đơn tần
+TX_GAIN_DB = 15             # CRITICAL: Bắt buộc hạ Gain xuống 35-40 để chống bão hòa ADC bên máy thu
+TX_BW_HZ = 8e6              # Mở bộ lọc analog 5M
+IF_OFFSET_HZ = 1.5e6          # Dịch tần baseband 1MHz để né nhiễu LO Leakage
+TX_AMPLITUDE = 0.15          # Biên độ số 0.3 để tránh tràn DAC
+TONE_SPACING_HZ = 6e4     # KHOẢNG CÁCH 2 ĐỈNH SIN: Ví dụ 100 kHz (Mỗi đỉnh cách tâm 50 kHz)
 # ==============================================================================
 
-TX_CENTER_HZ = 4.26e8
+TX_CENTER_HZ = 4.15e8
 
 stop_event = threading.Event()
 
@@ -114,28 +111,37 @@ class TxTopBlock(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self, "dual_usrp_sweep_gr_tx", catch_exceptions=True)
 
-        # --- OLD FILE SOURCE (COMMENTED OUT) ---
-        # self.tx_file_source = blocks.file_source(
-        #     gr.sizeof_gr_complex * 1,
-        #     TX_FILE,
-        #     True,
-        #     0,
-        #     0,
-        # )
-        # self.tx_file_source.set_begin_tag(pmt.PMT_NIL)
+        # --- NEW TWO-TONE SINE WAVE SOURCES ---
+        # Tần số 1: Dịch lùi so với IF_OFFSET một nửa khoảng cách
+        freq_tone_1 = IF_OFFSET_HZ - (TONE_SPACING_HZ / 2.0)
+        
+        # Tần số 2: Dịch tiến so với IF_OFFSET một nửa khoảng cách
+        freq_tone_2 = IF_OFFSET_HZ + (TONE_SPACING_HZ / 2.0)
 
-        # --- NEW SINE WAVE SOURCE ---
-        # Tạo sóng sin phức (Complex Exponential) ở tần số IF_OFFSET_HZ
-        self.tx_sig_source = analog.sig_source_c(
+        # Khởi tạo Sóng sin 1 (Complex Exponential)
+        self.tx_sig_source_1 = analog.sig_source_c(
             TX_SAMP_RATE,
-            analog.GR_COS_WAVE,  # GR_COS_WAVE cho luồng complex sẽ sinh ra e^(jwt)
-            IF_OFFSET_HZ,
-            TX_AMPLITUDE,
+            analog.GR_COS_WAVE, 
+            freq_tone_1,
+            TX_AMPLITUDE / 2.0,  # CỰC KỲ QUAN TRỌNG: Chia đôi biên độ để tổng 2 sóng không làm tràn DAC
             0
         )
 
+        # Khởi tạo Sóng sin 2 (Complex Exponential)
+        self.tx_sig_source_2 = analog.sig_source_c(
+            TX_SAMP_RATE,
+            analog.GR_COS_WAVE, 
+            freq_tone_2,
+            TX_AMPLITUDE / 2.0,  
+            0
+        )
+
+        # Khởi tạo bộ cộng luồng IQ phức (Complex Adder)
+        self.adder = blocks.add_cc()
+
+        # Khởi tạo USRP Sink
         self.usrp_sink = uhd.usrp_sink(
-            ",".join((f"serial={TX_SERIAL}", "serial=34D62A7,otw_format=sc16")),
+            ",".join((f"serial={TX_SERIAL}", f"otw_format=sc16")),
             uhd.stream_args(
                 cpu_format="fc32",
                 otw_format="sc16",
@@ -146,18 +152,19 @@ class TxTopBlock(gr.top_block):
         )
         self.usrp_sink.set_samp_rate(TX_SAMP_RATE)
         
-        # Thiết lập LO ban đầu có trừ đi offset
+        # Thiết lập LO cứng của phần cứng
         self.usrp_sink.set_center_freq(TX_CENTER_HZ - IF_OFFSET_HZ, 0)
-        
         self.usrp_sink.set_gain(TX_GAIN_DB, 0)
         self.usrp_sink.set_antenna("TX/RX", 0)
         self.usrp_sink.set_bandwidth(TX_BW_HZ, 0)
-
-        # --- OLD CONNECTION (COMMENTED OUT) ---
-        # self.connect((self.tx_file_source, 0), (self.usrp_sink, 0))
         
-        # --- NEW CONNECTION ---
-        self.connect((self.tx_sig_source, 0), (self.usrp_sink, 0))
+        # --- KẾT NỐI LUỒNG TÍN HIỆU (FLOWGRAPH CONNECTION) ---
+        # 1. Đấu sóng sin 1 vào cổng 0 của khối cộng
+        self.connect((self.tx_sig_source_1, 0), (self.adder, 0))
+        # 2. Đấu sóng sin 2 vào cổng 1 của khối cộng
+        self.connect((self.tx_sig_source_2, 0), (self.adder, 1))
+        # 3. Đấu tổng 2 sóng từ khối cộng xuống thiết bị USRP
+        self.connect((self.adder, 0), (self.usrp_sink, 0))
 
 
 def main():
